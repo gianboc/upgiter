@@ -1,11 +1,13 @@
-# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] --org|-o <org-or-user>
-# Clones missing repos for a GitHub org/user into a sibling folder. Defaults to this repo's name.
+# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--update|-u] --org|-o <org-or-user>
+# Default mode: clones missing repos for a GitHub org/user into a sibling folder.
+# Update mode (-u): hard-resets every existing repo to its remote default branch.
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
 
 # Script folder
 $scriptDir = $PSScriptRoot
 
+# Walk up from a directory to find the nearest .git root
 function Get-RepoRoot {
   param([string]$startDir)
 
@@ -24,11 +26,16 @@ function Get-RepoRoot {
 
 # Parse flags
 $dryRun = $false
+$update = $false
 $orgArg = $null
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
   if ($arg -eq "--dry-run" -or $arg -eq "-d") {
     $dryRun = $true
+    continue
+  }
+  if ($arg -eq "--update" -or $arg -eq "-u") {
+    $update = $true
     continue
   }
   if ($arg -eq "--org" -or $arg -eq "-o") {
@@ -41,7 +48,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     continue
   }
   Write-Error "Unknown argument: $arg"
-  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] --org|-o <org-or-user>"
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--update|-u] --org|-o <org-or-user>"
   exit 1
 }
 
@@ -69,68 +76,143 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 }
 
 if ($dryRun) {
-  Write-Host "DRY RUN: no clones will be performed"
+  Write-Host "DRY RUN: no changes will be made"
 }
-Write-Host "Cloning missing repos from org/user: $org"
 Write-Host "Target folder: $targetRoot"
 
-# Get all repo names from the org/user
-$repos = gh repo list $org --limit 1000 --json name -q '.[].name'
+if ($update) {
+  # --- UPDATE MODE: hard-reset existing repos to remote default branch ---
+  Write-Host "Updating existing repos for org/user: $org"
 
-if (-not $repos) {
-  Write-Host "No repositories found for org/user: $org"
-  exit 0
-}
+  # Initialize counters
+  $updated = @()
+  $skipped = @()
+  $warnings = @()
 
-# Initialize counters and printable lists
-$cloned = @()
-$skipped = @()
-$warnings = @()
+  # Iterate over every subdirectory in the target org folder
+  Get-ChildItem -Path $targetRoot -Directory | ForEach-Object {
+    $repo = $_.Name
+    $target = $_.FullName
+    $gitDir = Join-Path $target ".git"
 
-# Loop over each repo and clone only if missing
-$repos -split "`n" | ForEach-Object {
-  $repo = $_.Trim()
-  if (-not $repo) { return }
+    # Skip this repo itself to avoid resetting the running script
+    if ($target -eq $repoRoot) {
+      return
+    }
 
-  $target = Join-Path $targetRoot $repo
-  $gitDir = Join-Path $target ".git"
+    # Skip directories that are not git repos
+    if (-not (Test-Path $gitDir)) {
+      $skipped += $repo
+      return
+    }
 
-  # Skip if repo already exists
-  if (Test-Path $gitDir) {
-    $skipped += $repo
-    return
+    # Detect default branch from origin/HEAD (e.g. "main" or "master")
+    $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
+    if ($defaultBranch) {
+      $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
+    }
+    if (-not $defaultBranch) {
+      $warnings += $repo
+      Write-Host "  WARN: $repo - cannot detect default branch, skipping"
+      return
+    }
+
+    if ($dryRun) {
+      Write-Host "DRY RUN: would reset $repo to origin/$defaultBranch"
+    } else {
+      Write-Host "  Resetting $repo to origin/$defaultBranch ..."
+      # Fetch latest state from remote
+      git -C $target fetch origin
+      # Switch to the default branch
+      git -C $target checkout $defaultBranch
+      # Discard all local commits and staged/unstaged changes
+      git -C $target reset --hard "origin/$defaultBranch"
+      # Remove untracked files and directories
+      git -C $target clean -fd
+      # Drop all stashes
+      git -C $target stash clear
+    }
+
+    $updated += $repo
   }
 
-  # Warn if path exists but is not a git repo
-  if ((Test-Path $target) -and -not (Test-Path $gitDir)) {
-    $warnings += $repo
-    return
+  # Print a simple summary
+  Write-Host ""
+  Write-Host "Summary:"
+  Write-Host "  Updated: $($updated.Count)"
+  Write-Host "  Skipped: $($skipped.Count) (not a git repo)"
+  Write-Host "  Warned:  $($warnings.Count) (no default branch)"
+
+  if ($updated.Count -gt 0) {
+    Write-Host "  Updated list: $($updated -join ' ')"
+  }
+  if ($skipped.Count -gt 0) {
+    Write-Host "  Skipped list: $($skipped -join ' ')"
+  }
+  if ($warnings.Count -gt 0) {
+    Write-Host "  Warning list: $($warnings -join ' ')"
   }
 
-  # Clone the missing repo (or just print in dry-run)
-  if ($dryRun) {
-    Write-Host "DRY RUN: would clone $org/$repo -> $target"
-  } else {
-    gh repo clone "$org/$repo" $target
+} else {
+  # --- CLONE MODE: clone missing repos ---
+  Write-Host "Cloning missing repos from org/user: $org"
+
+  # Get all repo names from the org via GH CLI
+  $repos = gh repo list $org --limit 1000 --json name -q '.[].name'
+
+  if (-not $repos) {
+    Write-Host "No repositories found for org/user: $org"
+    exit 0
   }
-  $cloned += $repo
-}
 
-# Print a simple summary
-Write-Host ""
-Write-Host "Summary:"
-Write-Host "  Cloned:  $($cloned.Count)"
-Write-Host "  Skipped: $($skipped.Count)"
-Write-Host "  Warned:  $($warnings.Count)"
+  # Initialize counters
+  $cloned = @()
+  $skipped = @()
+  $warnings = @()
 
-if ($cloned.Count -gt 0) {
-  Write-Host "  Cloned list: $($cloned -join ' ')"
-}
+  # Loop over each repo and clone only if missing
+  $repos -split "`n" | ForEach-Object {
+    $repo = $_.Trim()
+    if (-not $repo) { return }
 
-if ($skipped.Count -gt 0) {
-  Write-Host "  Skipped list: $($skipped -join ' ')"
-}
+    $target = Join-Path $targetRoot $repo
+    $gitDir = Join-Path $target ".git"
 
-if ($warnings.Count -gt 0) {
-  Write-Host "  Warning (path exists without .git): $($warnings -join ' ')"
+    # Skip if repo already exists
+    if (Test-Path $gitDir) {
+      $skipped += $repo
+      return
+    }
+
+    # Warn if path exists but is not a git repo
+    if ((Test-Path $target) -and -not (Test-Path $gitDir)) {
+      $warnings += $repo
+      return
+    }
+
+    # Clone the missing repo (or just print in dry-run)
+    if ($dryRun) {
+      Write-Host "DRY RUN: would clone $org/$repo -> $target"
+    } else {
+      gh repo clone "$org/$repo" $target
+    }
+    $cloned += $repo
+  }
+
+  # Print a simple summary
+  Write-Host ""
+  Write-Host "Summary:"
+  Write-Host "  Cloned:  $($cloned.Count)"
+  Write-Host "  Skipped: $($skipped.Count)"
+  Write-Host "  Warned:  $($warnings.Count)"
+
+  if ($cloned.Count -gt 0) {
+    Write-Host "  Cloned list: $($cloned -join ' ')"
+  }
+  if ($skipped.Count -gt 0) {
+    Write-Host "  Skipped list: $($skipped -join ' ')"
+  }
+  if ($warnings.Count -gt 0) {
+    Write-Host "  Warning (path exists without .git): $($warnings -join ' ')"
+  }
 }

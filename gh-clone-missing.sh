@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./gh-clone-missing.sh [--dry-run|-d] --org|-o <org-or-user>
-# Clones missing repos for a GitHub org/user into a sibling folder. Defaults to this repo's name.
+# Usage: ./gh-clone-missing.sh [--dry-run|-d] [--update|-u] --org|-o <org-or-user>
+# Default mode: clones missing repos for a GitHub org/user into a sibling folder.
+# Update mode (-u): hard-resets every existing repo to its remote default branch.
 # Folder layout: BASE_ROOT/ORG_ROOT/REPO_ROOT  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into BASE_ROOT/<target-org>/<repo>
+
 # Script folder
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Walk up from a directory to find the nearest .git root
 get_repo_root() {
   local dir="$1"
   while true; do
@@ -26,11 +29,16 @@ get_repo_root() {
 
 # Parse flags
 DRY_RUN=0
+UPDATE=0
 ORG_ARG=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run|-d)
       DRY_RUN=1
+      shift
+      ;;
+    --update|-u)
+      UPDATE=1
       shift
       ;;
     --org|-o)
@@ -43,7 +51,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: ./gh-clone-missing.sh [--dry-run|-d] --org|-o <org-or-user>" >&2
+      echo "Usage: ./gh-clone-missing.sh [--dry-run|-d] [--update|-u] --org|-o <org-or-user>" >&2
       exit 1
       ;;
   esac
@@ -75,77 +83,154 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "DRY RUN: no clones will be performed"
+  echo "DRY RUN: no changes will be made"
 fi
-echo "Cloning missing repos from org/user: $ORG"
 echo "Target folder: $TARGET_ROOT"
 
-# Get all repo names from the org
-repos=$(gh repo list "$ORG" --limit 1000 --json name -q '.[].name')
+if [ "$UPDATE" -eq 1 ]; then
+  # --- UPDATE MODE: hard-reset existing repos to remote default branch ---
+  echo "Updating existing repos for org/user: $ORG"
 
-if [ -z "$repos" ]; then
-  echo "No repositories found for org: $ORG"
-  exit 0
-fi
+  # Initialize counters and printable lists
+  updated_count=0
+  skipped_count=0
+  warning_count=0
+  updated_list=""
+  skipped_list=""
+  warning_list=""
 
-# Initialize counters and printable lists
-cloned_count=0
-skipped_count=0
-warning_count=0
-cloned_list=""
-skipped_list=""
-warning_list=""
+  # Iterate over every subdirectory in the target org folder
+  for target in "$TARGET_ROOT"/*/; do
+    [ -d "$target" ] || continue
+    repo="$(basename "$target")"
 
-# Loop over each repo and clone only if missing
-while IFS= read -r repo; do
-  if [ -z "$repo" ]; then
-    continue
+    # Skip this repo itself to avoid resetting the running script
+    if [ "$(cd "$target" && pwd)" = "$REPO_ROOT" ]; then
+      continue
+    fi
+
+    # Skip directories that are not git repos
+    if [ ! -d "$target/.git" ]; then
+      skipped_count=$((skipped_count + 1))
+      skipped_list="$skipped_list $repo"
+      continue
+    fi
+
+    # Detect default branch from origin/HEAD (e.g. "main" or "master")
+    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    if [ -z "$default_branch" ]; then
+      warning_count=$((warning_count + 1))
+      warning_list="$warning_list $repo"
+      echo "  WARN: $repo — cannot detect default branch, skipping"
+      continue
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "DRY RUN: would reset $repo to origin/$default_branch"
+    else
+      echo "  Resetting $repo to origin/$default_branch ..."
+      # Fetch latest state from remote
+      git -C "$target" fetch origin
+      # Switch to the default branch
+      git -C "$target" checkout "$default_branch"
+      # Discard all local commits and staged/unstaged changes
+      git -C "$target" reset --hard "origin/$default_branch"
+      # Remove untracked files and directories
+      git -C "$target" clean -fd
+      # Drop all stashes
+      git -C "$target" stash clear
+    fi
+
+    updated_count=$((updated_count + 1))
+    updated_list="$updated_list $repo"
+  done
+
+  # Print a simple summary
+  echo ""
+  echo "Summary:"
+  echo "  Updated: $updated_count"
+  echo "  Skipped: $skipped_count (not a git repo)"
+  echo "  Warned:  $warning_count (no default branch)"
+
+  if [ "$updated_count" -gt 0 ]; then
+    echo "  Updated list: $updated_list"
+  fi
+  if [ "$skipped_count" -gt 0 ]; then
+    echo "  Skipped list: $skipped_list"
+  fi
+  if [ "$warning_count" -gt 0 ]; then
+    echo "  Warning list: $warning_list"
   fi
 
-  target="$TARGET_ROOT/$repo"
+else
+  # --- CLONE MODE: clone missing repos ---
+  echo "Cloning missing repos from org/user: $ORG"
 
-  # Skip if repo already exists
-  if [ -d "$target/.git" ]; then
-    skipped_count=$((skipped_count + 1))
-    skipped_list="$skipped_list $repo"
-    continue
+  # Get all repo names from the org via GH CLI
+  repos=$(gh repo list "$ORG" --limit 1000 --json name -q '.[].name')
+
+  if [ -z "$repos" ]; then
+    echo "No repositories found for org: $ORG"
+    exit 0
   fi
 
-  # Warn if path exists but is not a git repo
-  if [ -e "$target" ] && [ ! -d "$target/.git" ]; then
-    warning_count=$((warning_count + 1))
-    warning_list="$warning_list $repo"
-    continue
-  fi
+  # Initialize counters and printable lists
+  cloned_count=0
+  skipped_count=0
+  warning_count=0
+  cloned_list=""
+  skipped_list=""
+  warning_list=""
 
-  # Clone the missing repo (or just print in dry-run)
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "DRY RUN: would clone $ORG/$repo -> $target"
-  else
-    gh repo clone "$ORG/$repo" "$target"
-  fi
-  
-  cloned_count=$((cloned_count + 1))
-  cloned_list="$cloned_list $repo"
-done <<EOF
+  # Loop over each repo and clone only if missing
+  while IFS= read -r repo; do
+    if [ -z "$repo" ]; then
+      continue
+    fi
+
+    target="$TARGET_ROOT/$repo"
+
+    # Skip if repo already exists
+    if [ -d "$target/.git" ]; then
+      skipped_count=$((skipped_count + 1))
+      skipped_list="$skipped_list $repo"
+      continue
+    fi
+
+    # Warn if path exists but is not a git repo
+    if [ -e "$target" ] && [ ! -d "$target/.git" ]; then
+      warning_count=$((warning_count + 1))
+      warning_list="$warning_list $repo"
+      continue
+    fi
+
+    # Clone the missing repo (or just print in dry-run)
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "DRY RUN: would clone $ORG/$repo -> $target"
+    else
+      gh repo clone "$ORG/$repo" "$target"
+    fi
+
+    cloned_count=$((cloned_count + 1))
+    cloned_list="$cloned_list $repo"
+  done <<EOF
 $repos
 EOF
 
-# Print a simple summary
-echo ""
-echo "Summary:"
-echo "  Cloned:  $cloned_count"
-echo "  Skipped: $skipped_count"
-echo "  Warned:  $warning_count"
+  # Print a simple summary
+  echo ""
+  echo "Summary:"
+  echo "  Cloned:  $cloned_count"
+  echo "  Skipped: $skipped_count"
+  echo "  Warned:  $warning_count"
 
-if [ "$cloned_count" -gt 0 ]; then
-  echo "  Cloned list: $cloned_list"
-fi
-
-if [ "$skipped_count" -gt 0 ]; then
-  echo "  Skipped list: $skipped_list"
-fi
-
-if [ "$warning_count" -gt 0 ]; then
-  echo "  Warning (path exists without .git): $warning_list"
+  if [ "$cloned_count" -gt 0 ]; then
+    echo "  Cloned list: $cloned_list"
+  fi
+  if [ "$skipped_count" -gt 0 ]; then
+    echo "  Skipped list: $skipped_list"
+  fi
+  if [ "$warning_count" -gt 0 ]; then
+    echo "  Warning (path exists without .git): $warning_list"
+  fi
 fi
