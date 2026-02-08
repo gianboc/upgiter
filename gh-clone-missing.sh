@@ -125,7 +125,12 @@ if [ "$FETCH" -eq 1 ]; then
     fi
 
     # Detect default branch from origin/HEAD (e.g. "main" or "master")
-    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
+    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    if [ -z "$default_branch" ]; then
+      git -C "$target" remote set-head origin --auto >/dev/null 2>&1 || true
+      default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    fi
     if [ -z "$default_branch" ]; then
       warning_count=$((warning_count + 1))
       warning_list="$warning_list $repo"
@@ -134,14 +139,14 @@ if [ "$FETCH" -eq 1 ]; then
     fi
 
     # Fetch latest state from remote
-    git -C "$target" fetch origin 2>/dev/null
+    git -C "$target" fetch origin 2>/dev/null || true
 
     # Check each condition to build a reason string
-    current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null)"
-    remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null)"
-    dirty="$(git -C "$target" status --porcelain 2>/dev/null)"
-    stash_count_val="$(git -C "$target" stash list 2>/dev/null | wc -l)"
+    current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
+    remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null || true)"
+    dirty="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+    stash_count_val="$(git -C "$target" stash list 2>/dev/null | wc -l || true)"
 
     reasons=""
     if [ "$current_branch" != "$default_branch" ]; then
@@ -222,7 +227,12 @@ elif [ "$UPDATE" -eq 1 ]; then
     fi
 
     # Detect default branch from origin/HEAD (e.g. "main" or "master")
-    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
+    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    if [ -z "$default_branch" ]; then
+      git -C "$target" remote set-head origin --auto >/dev/null 2>&1 || true
+      default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    fi
     if [ -z "$default_branch" ]; then
       warning_count=$((warning_count + 1))
       warning_list="$warning_list $repo"
@@ -236,15 +246,15 @@ elif [ "$UPDATE" -eq 1 ]; then
       updated_list="$updated_list $repo"
     else
       # Fetch latest state from remote
-      git -C "$target" fetch origin
+      git -C "$target" fetch origin || true
 
       # Check if repo is already in sync: on default branch, at remote HEAD,
       # clean working tree, and no stashes
-      current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-      local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null)"
-      remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null)"
-      dirty="$(git -C "$target" status --porcelain 2>/dev/null)"
-      stash_count="$(git -C "$target" stash list 2>/dev/null | wc -l)"
+      current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
+      remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null || true)"
+      dirty="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+      stash_count="$(git -C "$target" stash list 2>/dev/null | wc -l || true)"
 
       if [ "$current_branch" = "$default_branch" ] && \
          [ "$local_head" = "$remote_head" ] && \

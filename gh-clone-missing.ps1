@@ -114,9 +114,17 @@ if ($fetch) {
     }
 
     # Detect default branch from origin/HEAD (e.g. "main" or "master")
+    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
     $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
     if ($defaultBranch) {
       $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
+    }
+    if (-not $defaultBranch) {
+      git -C $target remote set-head origin --auto 2>$null
+      $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
+      if ($defaultBranch) {
+        $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
+      }
     }
     if (-not $defaultBranch) {
       $warnings += $repo
@@ -206,9 +214,17 @@ if ($fetch) {
     }
 
     # Detect default branch from origin/HEAD (e.g. "main" or "master")
+    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
     $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
     if ($defaultBranch) {
       $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
+    }
+    if (-not $defaultBranch) {
+      git -C $target remote set-head origin --auto 2>$null
+      $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
+      if ($defaultBranch) {
+        $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
+      }
     }
     if (-not $defaultBranch) {
       $warnings += $repo
