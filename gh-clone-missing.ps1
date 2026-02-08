@@ -1,4 +1,4 @@
-# Usage: .\gh-clone-missing.ps1 [--dry-run|-n] --org|-o <org-or-user>
+# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] --org|-o <org-or-user>
 # Clones missing repos for a GitHub org/user into a sibling folder. Defaults to this repo's name.
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
@@ -27,7 +27,7 @@ $dryRun = $false
 $orgArg = $null
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
-  if ($arg -eq "--dry-run" -or $arg -eq "-n") {
+  if ($arg -eq "--dry-run" -or $arg -eq "-d") {
     $dryRun = $true
     continue
   }
@@ -41,7 +41,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     continue
   }
   Write-Error "Unknown argument: $arg"
-  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-n] --org|-o <org-or-user>"
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] --org|-o <org-or-user>"
   exit 1
 }
 

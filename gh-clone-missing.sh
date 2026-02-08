@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./gh-clone-missing.sh [--dry-run|-n] --org|-o <org-or-user>
+# Usage: ./gh-clone-missing.sh [--dry-run|-d] --org|-o <org-or-user>
 # Clones missing repos for a GitHub org/user into a sibling folder. Defaults to this repo's name.
 # Folder layout: BASE_ROOT/ORG_ROOT/REPO_ROOT  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into BASE_ROOT/<target-org>/<repo>
@@ -29,7 +29,7 @@ DRY_RUN=0
 ORG_ARG=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --dry-run|-n)
+    --dry-run|-d)
       DRY_RUN=1
       shift
       ;;
@@ -43,7 +43,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: ./gh-clone-missing.sh [--dry-run|-n] --org|-o <org-or-user>" >&2
+      echo "Usage: ./gh-clone-missing.sh [--dry-run|-d] --org|-o <org-or-user>" >&2
       exit 1
       ;;
   esac
