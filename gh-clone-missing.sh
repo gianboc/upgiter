@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./gh-clone-missing.sh [--dry-run|-d] [--fetch|-f] [--update|-u] --org|-o <org-or-user>
-# Default mode: clones missing repos for a GitHub org/user into a sibling folder.
-# Fetch mode (-f): fetches and reports which repos are stale (read-only, no changes).
-# Update mode (-u): hard-resets every existing repo to its remote default branch.
-# Folder layout: BASE_ROOT/ORG_ROOT/REPO_ROOT  (e.g. GITHUB/gianboc/upgiter)
-# Repos are cloned into BASE_ROOT/<target-org>/<repo>
+# upgiter — bulk GitHub repo manager
+#
+# Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update | -s|--sync] -o|--org <org-or-user>
+#        (or: ./gh-clone-missing.sh ...  if you haven't set up the alias yet)
+#
+# Modes (mutually exclusive; default is CLONE):
+#   CLONE   (no flag)   Clone every repo of <org> that is missing locally.
+#   FETCH   (-f)        Fetch each existing repo and report which are stale.
+#                       Read-only: no commits, branches, or files are touched.
+#   UPDATE  (-u)        DESTRUCTIVE. Hard-reset each existing repo to its remote
+#                       default branch: discards uncommitted work, untracked
+#                       files, and stashes. Skips repos already in sync.
+#   SYNC    (-s)        DESTRUCTIVE. The "nuclear button": clone missing repos
+#                       AND hard-reset modified ones to remote default. Clean
+#                       repos are left untouched. Makes local match remote in
+#                       one shot. Use -d to preview.
+#   -d / --dry-run      Print what would happen without making changes.
+#
+# Folder layout (required): <base>/<org>/<repo>
+#   This script must live at <base>/<org>/upgiter/ — it derives <base> by
+#   walking up from its own location. Repos are cloned to <base>/<org>/<repo>.
+#   Example: ~/GITHUB/gianboc/upgiter/  →  base = ~/GITHUB
+#
+# Run from anywhere by adding to ~/.bashrc:
+#   alias upgiter='/home/<you>/GITHUB/gianboc/upgiter/gh-clone-missing.sh'
 
 # Script folder
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -32,7 +51,9 @@ get_repo_root() {
 DRY_RUN=0
 FETCH=0
 UPDATE=0
+SYNC=0
 ORG_ARG=""
+USAGE="Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update | -s|--sync] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run|-d)
@@ -47,6 +68,10 @@ while [ "$#" -gt 0 ]; do
       UPDATE=1
       shift
       ;;
+    --sync|-s)
+      SYNC=1
+      shift
+      ;;
     --org|-o)
       if [ -z "${2:-}" ]; then
         echo "Missing value for --org" >&2
@@ -57,11 +82,18 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: ./gh-clone-missing.sh [--dry-run|-d] [--fetch|-f] [--update|-u] --org|-o <org-or-user>" >&2
+      echo "$USAGE" >&2
       exit 1
       ;;
   esac
 done
+
+# Modes are mutually exclusive
+if [ "$((FETCH + UPDATE + SYNC))" -gt 1 ]; then
+  echo "Error: -f/--fetch, -u/--update, and -s/--sync are mutually exclusive." >&2
+  echo "$USAGE" >&2
+  exit 1
+fi
 
 # Determine repo root and base folder that contains org folders
 REPO_ROOT="$(get_repo_root "$SCRIPT_DIR" || true)"
@@ -296,6 +328,127 @@ elif [ "$UPDATE" -eq 1 ]; then
   fi
   if [ "$skipped_count" -gt 0 ]; then
     echo "  Skipped list: $skipped_list"
+  fi
+  if [ "$warning_count" -gt 0 ]; then
+    echo "  Warning list: $warning_list"
+  fi
+
+elif [ "$SYNC" -eq 1 ]; then
+  # --- SYNC MODE: clone missing + hard-reset modified ("nuclear button") ---
+  echo "Syncing org/user: $ORG (clone missing + hard-reset modified)"
+
+  # Get all repo names from the org via GH CLI
+  repos=$(gh repo list "$ORG" --limit 1000 --json name -q '.[].name')
+
+  if [ -z "$repos" ]; then
+    echo "No repositories found for org: $ORG"
+    exit 0
+  fi
+
+  # Initialize counters and printable lists
+  cloned_count=0
+  updated_count=0
+  uptodate_count=0
+  warning_count=0
+  cloned_list=""
+  updated_list=""
+  uptodate_list=""
+  warning_list=""
+
+  while IFS= read -r repo; do
+    if [ -z "$repo" ]; then
+      continue
+    fi
+
+    target="$TARGET_ROOT/$repo"
+
+    # Skip this repo itself to avoid resetting the running script
+    if [ -d "$target/.git" ] && [ "$(cd "$target" && pwd)" = "$REPO_ROOT" ]; then
+      uptodate_count=$((uptodate_count + 1))
+      uptodate_list="$uptodate_list $repo"
+      continue
+    fi
+
+    # CASE A: not a git repo locally
+    if [ ! -d "$target/.git" ]; then
+      # Path exists but isn't a git repo — don't overwrite, warn instead
+      if [ -e "$target" ]; then
+        warning_count=$((warning_count + 1))
+        warning_list="$warning_list $repo"
+        continue
+      fi
+      # Truly missing — clone
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY RUN: would clone $ORG/$repo -> $target"
+      else
+        gh repo clone "$ORG/$repo" "$target"
+      fi
+      cloned_count=$((cloned_count + 1))
+      cloned_list="$cloned_list $repo"
+      continue
+    fi
+
+    # CASE B: repo exists locally — fetch and reset only if stale
+    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    if [ -z "$default_branch" ]; then
+      git -C "$target" remote set-head origin --auto >/dev/null 2>&1 || true
+      default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+    fi
+    if [ -z "$default_branch" ]; then
+      warning_count=$((warning_count + 1))
+      warning_list="$warning_list $repo"
+      echo "  WARN: $repo — cannot detect default branch, skipping"
+      continue
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "DRY RUN: would fetch $repo and reset to origin/$default_branch if stale"
+      continue
+    fi
+
+    git -C "$target" fetch origin || true
+
+    current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
+    remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null || true)"
+    dirty="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+    stash_count="$(git -C "$target" stash list 2>/dev/null | wc -l || true)"
+
+    if [ "$current_branch" = "$default_branch" ] && \
+       [ "$local_head" = "$remote_head" ] && \
+       [ -z "$dirty" ] && \
+       [ "$stash_count" -eq 0 ]; then
+      uptodate_count=$((uptodate_count + 1))
+      uptodate_list="$uptodate_list $repo"
+      continue
+    fi
+
+    echo "  Resetting $repo to origin/$default_branch ..."
+    git -C "$target" checkout "$default_branch"
+    git -C "$target" reset --hard "origin/$default_branch"
+    git -C "$target" clean -fd
+    git -C "$target" stash clear
+    updated_count=$((updated_count + 1))
+    updated_list="$updated_list $repo"
+  done <<EOF
+$repos
+EOF
+
+  echo ""
+  echo "Summary:"
+  echo "  Cloned:     $cloned_count"
+  echo "  Updated:    $updated_count"
+  echo "  Up to date: $uptodate_count"
+  echo "  Warned:     $warning_count"
+
+  if [ "$cloned_count" -gt 0 ]; then
+    echo "  Cloned list: $cloned_list"
+  fi
+  if [ "$updated_count" -gt 0 ]; then
+    echo "  Updated list: $updated_list"
+  fi
+  if [ "$uptodate_count" -gt 0 ]; then
+    echo "  Up to date list: $uptodate_list"
   fi
   if [ "$warning_count" -gt 0 ]; then
     echo "  Warning list: $warning_list"
