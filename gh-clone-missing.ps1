@@ -1,7 +1,19 @@
 # Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f] [--update|-u] --org|-o <org-or-user>
-# Default mode: clones missing repos for a GitHub org/user into a sibling folder.
-# Fetch mode (-f): fetches and reports which repos are stale (read-only, no changes).
-# Update mode (-u): hard-resets every existing repo to its remote default branch.
+#
+# Modes (mutually exclusive; default is CLONE):
+#   CLONE  (no flag)  Clone every repo of <org> that is missing locally.
+#   FETCH  (-f)       Fetch each existing repo and report which are stale.
+#                     Read-only: no commits, branches, or files are touched.
+#   UPDATE (-u)       DESTRUCTIVE. Hard-reset existing repos to remote default:
+#                     discards uncommitted work, untracked files, and stashes
+#                     for any repo not already in sync. Clean repos are left
+#                     untouched. UPDATE only touches repos already present
+#                     locally — it iterates the local <org> folder, so repos
+#                     you've never cloned are invisible to it.
+#
+# NOTE: the SYNC mode (-s = UPDATE + clone-the-missing) exists only in the bash
+# version (gh-clone-missing.sh). This PowerShell port does not implement it yet.
+#
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
 
@@ -23,6 +35,33 @@ function Get-RepoRoot {
     }
     $current = $parent
   }
+}
+
+# Force a repo to exactly match origin/<branch>, no matter what state it's in.
+# An interrupted merge/rebase/cherry-pick leaves unmerged index entries, and
+# git then refuses to switch branches ("you need to resolve your current index
+# first"). We abort any in-progress operation and clear the index first, then
+# force the checkout and reset. Returns $true on success, $false on failure
+# (so one wedged repo doesn't stop a sweep across the whole org).
+function Reset-RepoToRemote {
+  param([string]$target, [string]$branch)
+
+  # Bail out of any half-finished operation that's holding the index hostage.
+  git -C $target merge --abort       2>$null
+  git -C $target rebase --abort      2>$null
+  git -C $target cherry-pick --abort 2>$null
+  git -C $target am --abort          2>$null
+  # Clear any remaining unmerged entries so the checkout below can proceed.
+  git -C $target reset --hard        2>$null
+  # Now force onto the default branch and pin to the remote tip.
+  git -C $target checkout -f $branch
+  if ($LASTEXITCODE -ne 0) { return $false }
+  git -C $target reset --hard "origin/$branch"
+  if ($LASTEXITCODE -ne 0) { return $false }
+  git -C $target clean -fd
+  if ($LASTEXITCODE -ne 0) { return $false }
+  git -C $target stash clear 2>$null
+  return $true
 }
 
 # Parse flags
@@ -195,6 +234,7 @@ if ($fetch) {
   $uptodate = @()
   $skipped = @()
   $warnings = @()
+  $failed = @()
 
   # Iterate over every subdirectory in the target org folder
   Get-ChildItem -Path $targetRoot -Directory | ForEach-Object {
@@ -256,16 +296,12 @@ if ($fetch) {
       }
 
       Write-Host "  Resetting $repo to origin/$defaultBranch ..."
-      # Switch to the default branch
-      git -C $target checkout $defaultBranch
-      # Discard all local commits and staged/unstaged changes
-      git -C $target reset --hard "origin/$defaultBranch"
-      # Remove untracked files and directories
-      git -C $target clean -fd
-      # Drop all stashes
-      git -C $target stash clear
-
-      $updated += $repo
+      if (Reset-RepoToRemote $target $defaultBranch) {
+        $updated += $repo
+      } else {
+        $failed += $repo
+        Write-Host "  FAILED: $repo - could not reset to origin/$defaultBranch"
+      }
     }
   }
 
@@ -276,6 +312,7 @@ if ($fetch) {
   Write-Host "  Up to date: $($uptodate.Count)"
   Write-Host "  Skipped:    $($skipped.Count) (not a git repo)"
   Write-Host "  Warned:     $($warnings.Count) (no default branch)"
+  Write-Host "  Failed:     $($failed.Count) (reset error)"
 
   if ($updated.Count -gt 0) {
     Write-Host "  Updated list: $($updated -join ' ')"
@@ -288,6 +325,9 @@ if ($fetch) {
   }
   if ($warnings.Count -gt 0) {
     Write-Host "  Warning list: $($warnings -join ' ')"
+  }
+  if ($failed.Count -gt 0) {
+    Write-Host "  Failed list: $($failed -join ' ')"
   }
 
 } else {

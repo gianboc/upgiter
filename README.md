@@ -99,6 +99,29 @@ GitHub:
 Mode flags `-f`, `-u`, and `-s` are mutually exclusive — passing two at once
 exits with an error.
 
+#### Update vs Sync at a glance
+
+They share the **same reset behavior**; the only difference is whether repos
+you don't have locally get cloned.
+
+|                                              | `-u` Update | `-s` Sync |
+| -------------------------------------------- | :---------: | :-------: |
+| Reset existing modified repos to remote      |     yes     |    yes    |
+| Leave clean / in-sync repos untouched        |     yes     |    yes    |
+| Clone repos not yet present locally          |     no      |    yes    |
+
+Why: **Update** iterates your *local* `<org>` folder, so a repo you've never
+cloned is invisible to it. **Sync** iterates the *remote* repo list
+(`gh repo list`), so it sees everything on GitHub and pulls the missing ones
+down. In short, **Sync = Update + clone-the-missing**.
+
+#### When a repo can't be reset
+
+If a repo is wedged (e.g. an interrupted merge with conflicts), upgiter aborts
+the stuck operation and force-resets it. If it still can't, that one repo is
+reported under **Failed** in the summary and the sweep continues — a single bad
+repo no longer aborts the whole run.
+
 ### Dry-run modifier (`-d`)
 
 Combine with any mode to print the planned actions without executing them:

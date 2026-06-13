@@ -10,14 +10,26 @@ set -euo pipefail
 #   CLONE   (no flag)   Clone every repo of <org> that is missing locally.
 #   FETCH   (-f)        Fetch each existing repo and report which are stale.
 #                       Read-only: no commits, branches, or files are touched.
-#   UPDATE  (-u)        DESTRUCTIVE. Hard-reset each existing repo to its remote
-#                       default branch: discards uncommitted work, untracked
-#                       files, and stashes. Skips repos already in sync.
-#   SYNC    (-s)        DESTRUCTIVE. The "nuclear button": clone missing repos
-#                       AND hard-reset modified ones to remote default. Clean
-#                       repos are left untouched. Makes local match remote in
-#                       one shot. Use -d to preview.
+#   UPDATE  (-u)        DESTRUCTIVE. Hard-reset existing repos to remote default.
+#   SYNC    (-s)        DESTRUCTIVE. UPDATE plus clone any missing repos.
 #   -d / --dry-run      Print what would happen without making changes.
+#
+# UPDATE vs SYNC — they share the same reset behavior; the one difference is
+# whether repos missing locally get cloned. SYNC = UPDATE + clone-the-missing.
+#
+#                                              UPDATE (-u)   SYNC (-s)
+#   Reset existing modified repos to remote        yes          yes
+#   Leave clean / in-sync repos untouched          yes          yes
+#   Clone repos not yet present locally            no           yes
+#
+#   Why the difference: UPDATE iterates the LOCAL <org> folder, so repos you
+#   have never cloned are invisible to it. SYNC iterates the REMOTE repo list
+#   (gh repo list), so it sees everything on GitHub and pulls down the missing.
+#   SYNC is the "nuclear button": makes local exactly match remote in one shot.
+#
+#   "DESTRUCTIVE" (both modes): for any repo not already in sync, discards
+#   uncommitted work, untracked files, and stashes via hard-reset + clean -fd
+#   + stash clear. Clean repos are never touched. Use -d to preview.
 #
 # Folder layout (required): <base>/<org>/<repo>
 #   This script must live at <base>/<org>/upgiter/ — it derives <base> by
@@ -45,6 +57,32 @@ get_repo_root() {
     fi
     dir="$parent"
   done
+}
+
+# Force a repo to exactly match origin/<branch>, no matter what state it's in.
+# Handles the awkward cases that a plain "checkout + reset --hard" chokes on:
+# an interrupted merge/rebase/cherry-pick leaves unmerged index entries, and
+# git then refuses to switch branches ("you need to resolve your current index
+# first"). We abort any in-progress operation and clear the index first, then
+# force the checkout and reset.
+#
+# Returns non-zero on failure instead of letting `set -e` abort the whole run,
+# so one wedged repo doesn't stop a sweep across an org of 100 repos.
+force_reset_to_remote() {
+  local target="$1" branch="$2"
+  # Bail out of any half-finished operation that's holding the index hostage.
+  git -C "$target" merge --abort       >/dev/null 2>&1 || true
+  git -C "$target" rebase --abort      >/dev/null 2>&1 || true
+  git -C "$target" cherry-pick --abort >/dev/null 2>&1 || true
+  git -C "$target" am --abort          >/dev/null 2>&1 || true
+  # Clear any remaining unmerged entries so the checkout below can proceed.
+  git -C "$target" reset --hard        >/dev/null 2>&1 || true
+  # Now force onto the default branch and pin to the remote tip.
+  git -C "$target" checkout -f "$branch"          || return 1
+  git -C "$target" reset --hard "origin/$branch"  || return 1
+  git -C "$target" clean -fd                      || return 1
+  git -C "$target" stash clear                    || true
+  return 0
 }
 
 # Parse flags
@@ -236,10 +274,12 @@ elif [ "$UPDATE" -eq 1 ]; then
   uptodate_count=0
   skipped_count=0
   warning_count=0
+  failed_count=0
   updated_list=""
   uptodate_list=""
   skipped_list=""
   warning_list=""
+  failed_list=""
 
   # Iterate over every subdirectory in the target org folder
   for target in "$TARGET_ROOT"/*/; do
@@ -298,17 +338,14 @@ elif [ "$UPDATE" -eq 1 ]; then
       fi
 
       echo "  Resetting $repo to origin/$default_branch ..."
-      # Switch to the default branch
-      git -C "$target" checkout "$default_branch"
-      # Discard all local commits and staged/unstaged changes
-      git -C "$target" reset --hard "origin/$default_branch"
-      # Remove untracked files and directories
-      git -C "$target" clean -fd
-      # Drop all stashes
-      git -C "$target" stash clear
-
-      updated_count=$((updated_count + 1))
-      updated_list="$updated_list $repo"
+      if force_reset_to_remote "$target" "$default_branch"; then
+        updated_count=$((updated_count + 1))
+        updated_list="$updated_list $repo"
+      else
+        failed_count=$((failed_count + 1))
+        failed_list="$failed_list $repo"
+        echo "  FAILED: $repo — could not reset to origin/$default_branch"
+      fi
     fi
   done
 
@@ -319,6 +356,7 @@ elif [ "$UPDATE" -eq 1 ]; then
   echo "  Up to date: $uptodate_count"
   echo "  Skipped:    $skipped_count (not a git repo)"
   echo "  Warned:     $warning_count (no default branch)"
+  echo "  Failed:     $failed_count (reset error)"
 
   if [ "$updated_count" -gt 0 ]; then
     echo "  Updated list: $updated_list"
@@ -331,6 +369,9 @@ elif [ "$UPDATE" -eq 1 ]; then
   fi
   if [ "$warning_count" -gt 0 ]; then
     echo "  Warning list: $warning_list"
+  fi
+  if [ "$failed_count" -gt 0 ]; then
+    echo "  Failed list: $failed_list"
   fi
 
 elif [ "$SYNC" -eq 1 ]; then
@@ -350,10 +391,12 @@ elif [ "$SYNC" -eq 1 ]; then
   updated_count=0
   uptodate_count=0
   warning_count=0
+  failed_count=0
   cloned_list=""
   updated_list=""
   uptodate_list=""
   warning_list=""
+  failed_list=""
 
   while IFS= read -r repo; do
     if [ -z "$repo" ]; then
@@ -424,12 +467,14 @@ elif [ "$SYNC" -eq 1 ]; then
     fi
 
     echo "  Resetting $repo to origin/$default_branch ..."
-    git -C "$target" checkout "$default_branch"
-    git -C "$target" reset --hard "origin/$default_branch"
-    git -C "$target" clean -fd
-    git -C "$target" stash clear
-    updated_count=$((updated_count + 1))
-    updated_list="$updated_list $repo"
+    if force_reset_to_remote "$target" "$default_branch"; then
+      updated_count=$((updated_count + 1))
+      updated_list="$updated_list $repo"
+    else
+      failed_count=$((failed_count + 1))
+      failed_list="$failed_list $repo"
+      echo "  FAILED: $repo — could not reset to origin/$default_branch"
+    fi
   done <<EOF
 $repos
 EOF
@@ -440,6 +485,7 @@ EOF
   echo "  Updated:    $updated_count"
   echo "  Up to date: $uptodate_count"
   echo "  Warned:     $warning_count"
+  echo "  Failed:     $failed_count (reset error)"
 
   if [ "$cloned_count" -gt 0 ]; then
     echo "  Cloned list: $cloned_list"
@@ -452,6 +498,9 @@ EOF
   fi
   if [ "$warning_count" -gt 0 ]; then
     echo "  Warning list: $warning_list"
+  fi
+  if [ "$failed_count" -gt 0 ]; then
+    echo "  Failed list: $failed_list"
   fi
 
 else
