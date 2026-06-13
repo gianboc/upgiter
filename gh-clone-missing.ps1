@@ -1,7 +1,11 @@
-# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f] [--update|-u] --org|-o <org-or-user>
+# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>
 # Default mode: clones missing repos for a GitHub org/user into a sibling folder.
 # Fetch mode (-f): fetches and reports which repos are stale (read-only, no changes).
-# Update mode (-u): hard-resets every existing repo to its remote default branch.
+# Update mode (-u): DESTRUCTIVE. The "nuclear button": clone missing repos AND
+#   hard-reset modified ones to the remote default branch (discards uncommitted
+#   work, untracked files, and stashes). Clean repos are left untouched. Makes
+#   local match remote in one shot. Use -d to preview.
+# Modes (-f / -u) are mutually exclusive; default is CLONE.
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
 
@@ -54,7 +58,14 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     continue
   }
   Write-Error "Unknown argument: $arg"
-  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f] [--update|-u] --org|-o <org-or-user>"
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
+  exit 1
+}
+
+# Modes are mutually exclusive
+if ($fetch -and $update) {
+  Write-Error "-f/--fetch and -u/--update are mutually exclusive."
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
   exit 1
 }
 
@@ -187,34 +198,54 @@ if ($fetch) {
   }
 
 } elseif ($update) {
-  # --- UPDATE MODE: hard-reset existing repos to remote default branch ---
-  Write-Host "Updating existing repos for org/user: $org"
+  # --- UPDATE MODE: clone missing + hard-reset modified ("nuclear button") ---
+  Write-Host "Updating org/user: $org (clone missing + hard-reset modified)"
+
+  # Get all repo names from the org via GH CLI
+  $repos = gh repo list $org --limit 1000 --json name -q '.[].name'
+
+  if (-not $repos) {
+    Write-Host "No repositories found for org/user: $org"
+    exit 0
+  }
 
   # Initialize counters
+  $cloned = @()
   $updated = @()
   $uptodate = @()
-  $skipped = @()
   $warnings = @()
 
-  # Iterate over every subdirectory in the target org folder
-  Get-ChildItem -Path $targetRoot -Directory | ForEach-Object {
-    $repo = $_.Name
-    $target = $_.FullName
+  $repos -split "`n" | ForEach-Object {
+    $repo = $_.Trim()
+    if (-not $repo) { return }
+
+    $target = Join-Path $targetRoot $repo
     $gitDir = Join-Path $target ".git"
 
     # Skip this repo itself to avoid resetting the running script
-    if ($target -eq $repoRoot) {
+    if ((Test-Path $gitDir) -and ($target -eq $repoRoot)) {
+      $uptodate += $repo
       return
     }
 
-    # Skip directories that are not git repos
+    # CASE A: not a git repo locally
     if (-not (Test-Path $gitDir)) {
-      $skipped += $repo
+      # Path exists but isn't a git repo - don't overwrite, warn instead
+      if (Test-Path $target) {
+        $warnings += $repo
+        return
+      }
+      # Truly missing - clone
+      if ($dryRun) {
+        Write-Host "DRY RUN: would clone $org/$repo -> $target"
+      } else {
+        gh repo clone "$org/$repo" $target
+      }
+      $cloned += $repo
       return
     }
 
-    # Detect default branch from origin/HEAD (e.g. "main" or "master")
-    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
+    # CASE B: repo exists locally - fetch and reset only if stale
     $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
     if ($defaultBranch) {
       $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
@@ -233,58 +264,58 @@ if ($fetch) {
     }
 
     if ($dryRun) {
-      Write-Host "DRY RUN: would reset $repo to origin/$defaultBranch"
-      $updated += $repo
-    } else {
-      # Fetch latest state from remote
-      git -C $target fetch origin
-
-      # Check if repo is already in sync: on default branch, at remote HEAD,
-      # clean working tree, and no stashes
-      $currentBranch = git -C $target rev-parse --abbrev-ref HEAD 2>$null
-      $localHead = git -C $target rev-parse HEAD 2>$null
-      $remoteHead = git -C $target rev-parse "origin/$defaultBranch" 2>$null
-      $dirty = git -C $target status --porcelain 2>$null
-      $stashList = git -C $target stash list 2>$null
-
-      if ($currentBranch -eq $defaultBranch -and `
-          $localHead -eq $remoteHead -and `
-          -not $dirty -and `
-          -not $stashList) {
-        $uptodate += $repo
-        return
-      }
-
-      Write-Host "  Resetting $repo to origin/$defaultBranch ..."
-      # Switch to the default branch
-      git -C $target checkout $defaultBranch
-      # Discard all local commits and staged/unstaged changes
-      git -C $target reset --hard "origin/$defaultBranch"
-      # Remove untracked files and directories
-      git -C $target clean -fd
-      # Drop all stashes
-      git -C $target stash clear
-
-      $updated += $repo
+      Write-Host "DRY RUN: would fetch $repo and reset to origin/$defaultBranch if stale"
+      return
     }
+
+    # Fetch latest state from remote
+    git -C $target fetch origin
+
+    # Check if repo is already in sync: on default branch, at remote HEAD,
+    # clean working tree, and no stashes
+    $currentBranch = git -C $target rev-parse --abbrev-ref HEAD 2>$null
+    $localHead = git -C $target rev-parse HEAD 2>$null
+    $remoteHead = git -C $target rev-parse "origin/$defaultBranch" 2>$null
+    $dirty = git -C $target status --porcelain 2>$null
+    $stashList = git -C $target stash list 2>$null
+
+    if ($currentBranch -eq $defaultBranch -and `
+        $localHead -eq $remoteHead -and `
+        -not $dirty -and `
+        -not $stashList) {
+      $uptodate += $repo
+      return
+    }
+
+    Write-Host "  Resetting $repo to origin/$defaultBranch ..."
+    # Switch to the default branch
+    git -C $target checkout $defaultBranch
+    # Discard all local commits and staged/unstaged changes
+    git -C $target reset --hard "origin/$defaultBranch"
+    # Remove untracked files and directories
+    git -C $target clean -fd
+    # Drop all stashes
+    git -C $target stash clear
+
+    $updated += $repo
   }
 
   # Print a simple summary
   Write-Host ""
   Write-Host "Summary:"
+  Write-Host "  Cloned:     $($cloned.Count)"
   Write-Host "  Updated:    $($updated.Count)"
   Write-Host "  Up to date: $($uptodate.Count)"
-  Write-Host "  Skipped:    $($skipped.Count) (not a git repo)"
-  Write-Host "  Warned:     $($warnings.Count) (no default branch)"
+  Write-Host "  Warned:     $($warnings.Count)"
 
+  if ($cloned.Count -gt 0) {
+    Write-Host "  Cloned list: $($cloned -join ' ')"
+  }
   if ($updated.Count -gt 0) {
     Write-Host "  Updated list: $($updated -join ' ')"
   }
   if ($uptodate.Count -gt 0) {
     Write-Host "  Up to date list: $($uptodate -join ' ')"
-  }
-  if ($skipped.Count -gt 0) {
-    Write-Host "  Skipped list: $($skipped -join ' ')"
   }
   if ($warnings.Count -gt 0) {
     Write-Host "  Warning list: $($warnings -join ' ')"
