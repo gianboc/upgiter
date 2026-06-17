@@ -1,28 +1,11 @@
-# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u | --sync|-s] --org|-o <org-or-user>
-#
-# Modes (mutually exclusive; default is CLONE):
-#   CLONE  (no flag)  Clone every repo of <org> that is missing locally.
-#   FETCH  (-f)       Fetch each existing repo and report which are stale.
-#                     Read-only: no commits, branches, or files are touched.
-#   UPDATE (-u)       DESTRUCTIVE. Hard-reset existing repos to remote default.
-#   SYNC   (-s)       DESTRUCTIVE. UPDATE plus clone any missing repos.
-#
-# UPDATE vs SYNC — they share the same reset behavior; the one difference is
-# whether repos missing locally get cloned. SYNC = UPDATE + clone-the-missing.
-#
-#                                              UPDATE (-u)   SYNC (-s)
-#   Reset existing modified repos to remote        yes          yes
-#   Leave clean / in-sync repos untouched          yes          yes
-#   Clone repos not yet present locally            no           yes
-#
-#   Why the difference: UPDATE iterates the LOCAL <org> folder, so repos you
-#   have never cloned are invisible to it. SYNC iterates the REMOTE repo list
-#   (gh repo list), so it sees everything on GitHub and pulls down the missing.
-#
-#   "DESTRUCTIVE" (both modes): for any repo not already in sync, discards
-#   uncommitted work, untracked files, and stashes via hard-reset + clean -fd
-#   + stash clear. Clean repos are never touched. Use -d to preview.
-#
+# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>
+# Default mode: clones missing repos for a GitHub org/user into a sibling folder.
+# Fetch mode (-f): fetches and reports which repos are stale (read-only, no changes).
+# Update mode (-u): DESTRUCTIVE. The "nuclear button": clone missing repos AND
+#   hard-reset modified ones to the remote default branch (discards uncommitted
+#   work, untracked files, and stashes). Clean repos are left untouched. Makes
+#   local match remote in one shot. Use -d to preview.
+# Modes (-f / -u) are mutually exclusive; default is CLONE.
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
 
@@ -83,9 +66,7 @@ function Reset-RepoToRemote {
 $dryRun = $false
 $fetch = $false
 $update = $false
-$sync = $false
 $orgArg = $null
-$usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u | --sync|-s] --org|-o <org-or-user>"
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
   if ($arg -eq "--dry-run" -or $arg -eq "-d") {
@@ -100,10 +81,6 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     $update = $true
     continue
   }
-  if ($arg -eq "--sync" -or $arg -eq "-s") {
-    $sync = $true
-    continue
-  }
   if ($arg -eq "--org" -or $arg -eq "-o") {
     if ($i + 1 -ge $args.Count) {
       Write-Error "Missing value for --org"
@@ -114,14 +91,14 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     continue
   }
   Write-Error "Unknown argument: $arg"
-  Write-Host $usage
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
   exit 1
 }
 
 # Modes are mutually exclusive
-if (([int]$fetch + [int]$update + [int]$sync) -gt 1) {
-  Write-Error "Error: -f/--fetch, -u/--update, and -s/--sync are mutually exclusive."
-  Write-Host $usage
+if ($fetch -and $update) {
+  Write-Error "-f/--fetch and -u/--update are mutually exclusive."
+  Write-Host "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
   exit 1
 }
 
@@ -254,115 +231,10 @@ if ($fetch) {
   }
 
 } elseif ($update) {
-  # --- UPDATE MODE: hard-reset existing repos to remote default branch ---
-  Write-Host "Updating existing repos for org/user: $org"
-
-  # Initialize counters
-  $updated = @()
-  $uptodate = @()
-  $skipped = @()
-  $warnings = @()
-  $failed = @()
-
-  # Iterate over every subdirectory in the target org folder
-  Get-ChildItem -Path $targetRoot -Directory | ForEach-Object {
-    $repo = $_.Name
-    $target = $_.FullName
-    $gitDir = Join-Path $target ".git"
-
-    # Skip this repo itself to avoid resetting the running script
-    if ($target -eq $repoRoot) {
-      return
-    }
-
-    # Skip directories that are not git repos
-    if (-not (Test-Path $gitDir)) {
-      $skipped += $repo
-      return
-    }
-
-    # Detect default branch from origin/HEAD (e.g. "main" or "master")
-    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
-    $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
-    if ($defaultBranch) {
-      $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
-    }
-    if (-not $defaultBranch) {
-      git -C $target remote set-head origin --auto 2>$null
-      $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
-      if ($defaultBranch) {
-        $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', ''
-      }
-    }
-    if (-not $defaultBranch) {
-      $warnings += $repo
-      Write-Host "  WARN: $repo - cannot detect default branch, skipping"
-      return
-    }
-
-    if ($dryRun) {
-      Write-Host "DRY RUN: would reset $repo to origin/$defaultBranch"
-      $updated += $repo
-    } else {
-      # Fetch latest state from remote
-      git -C $target fetch origin
-
-      # Check if repo is already in sync: on default branch, at remote HEAD,
-      # clean working tree, and no stashes
-      $currentBranch = git -C $target rev-parse --abbrev-ref HEAD 2>$null
-      $localHead = git -C $target rev-parse HEAD 2>$null
-      $remoteHead = git -C $target rev-parse "origin/$defaultBranch" 2>$null
-      $dirty = git -C $target status --porcelain 2>$null
-      $stashList = git -C $target stash list 2>$null
-
-      if ($currentBranch -eq $defaultBranch -and `
-          $localHead -eq $remoteHead -and `
-          -not $dirty -and `
-          -not $stashList) {
-        $uptodate += $repo
-        return
-      }
-
-      Write-Host "  Resetting $repo to origin/$defaultBranch ..."
-      if (Reset-RepoToRemote $target $defaultBranch) {
-        $updated += $repo
-      } else {
-        $failed += $repo
-        Write-Host "  FAILED: $repo - could not reset to origin/$defaultBranch"
-      }
-    }
-  }
-
-  # Print a simple summary
-  Write-Host ""
-  Write-Host "Summary:"
-  Write-Host "  Updated:    $($updated.Count)"
-  Write-Host "  Up to date: $($uptodate.Count)"
-  Write-Host "  Skipped:    $($skipped.Count) (not a git repo)"
-  Write-Host "  Warned:     $($warnings.Count) (no default branch)"
-  Write-Host "  Failed:     $($failed.Count) (reset error)"
-
-  if ($updated.Count -gt 0) {
-    Write-Host "  Updated list: $($updated -join ' ')"
-  }
-  if ($uptodate.Count -gt 0) {
-    Write-Host "  Up to date list: $($uptodate -join ' ')"
-  }
-  if ($skipped.Count -gt 0) {
-    Write-Host "  Skipped list: $($skipped -join ' ')"
-  }
-  if ($warnings.Count -gt 0) {
-    Write-Host "  Warning list: $($warnings -join ' ')"
-  }
-  if ($failed.Count -gt 0) {
-    Write-Host "  Failed list: $($failed -join ' ')"
-  }
-
-} elseif ($sync) {
-  # --- SYNC MODE: clone missing + hard-reset modified ("nuclear button") ---
+  # --- UPDATE MODE: clone missing + hard-reset modified ("nuclear button") ---
   # Archived repos are intentionally excluded (--no-archived): mothballed repos
   # should not be cloned or reset back onto your machine.
-  Write-Host "Syncing org/user: $org (clone missing + hard-reset modified; archived repos skipped)"
+  Write-Host "Updating org/user: $org (clone missing + hard-reset modified; archived repos skipped)"
 
   # Get all non-archived repo names from the org via GH CLI
   $repos = gh repo list $org --no-archived --limit 1000 --json name -q '.[].name'
@@ -432,8 +304,11 @@ if ($fetch) {
       return
     }
 
+    # Fetch latest state from remote
     git -C $target fetch origin
 
+    # Check if repo is already in sync: on default branch, at remote HEAD,
+    # clean working tree, and no stashes
     $currentBranch = git -C $target rev-parse --abbrev-ref HEAD 2>$null
     $localHead = git -C $target rev-parse HEAD 2>$null
     $remoteHead = git -C $target rev-parse "origin/$defaultBranch" 2>$null

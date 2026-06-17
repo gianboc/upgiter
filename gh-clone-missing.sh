@@ -3,33 +3,19 @@ set -euo pipefail
 
 # upgiter — bulk GitHub repo manager
 #
-# Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update | -s|--sync] -o|--org <org-or-user>
+# Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update] -o|--org <org-or-user>
 #        (or: ./gh-clone-missing.sh ...  if you haven't set up the alias yet)
 #
 # Modes (mutually exclusive; default is CLONE):
 #   CLONE   (no flag)   Clone every repo of <org> that is missing locally.
 #   FETCH   (-f)        Fetch each existing repo and report which are stale.
 #                       Read-only: no commits, branches, or files are touched.
-#   UPDATE  (-u)        DESTRUCTIVE. Hard-reset existing repos to remote default.
-#   SYNC    (-s)        DESTRUCTIVE. UPDATE plus clone any missing repos.
+#   UPDATE  (-u)        DESTRUCTIVE. The "nuclear button": clone missing repos
+#                       AND hard-reset modified ones to the remote default
+#                       branch (discards uncommitted work, untracked files, and
+#                       stashes). Clean repos are left untouched. Makes local
+#                       match remote in one shot. Use -d to preview.
 #   -d / --dry-run      Print what would happen without making changes.
-#
-# UPDATE vs SYNC — they share the same reset behavior; the one difference is
-# whether repos missing locally get cloned. SYNC = UPDATE + clone-the-missing.
-#
-#                                              UPDATE (-u)   SYNC (-s)
-#   Reset existing modified repos to remote        yes          yes
-#   Leave clean / in-sync repos untouched          yes          yes
-#   Clone repos not yet present locally            no           yes
-#
-#   Why the difference: UPDATE iterates the LOCAL <org> folder, so repos you
-#   have never cloned are invisible to it. SYNC iterates the REMOTE repo list
-#   (gh repo list), so it sees everything on GitHub and pulls down the missing.
-#   SYNC is the "nuclear button": makes local exactly match remote in one shot.
-#
-#   "DESTRUCTIVE" (both modes): for any repo not already in sync, discards
-#   uncommitted work, untracked files, and stashes via hard-reset + clean -fd
-#   + stash clear. Clean repos are never touched. Use -d to preview.
 #
 # Folder layout (required): <base>/<org>/<repo>
 #   This script must live at <base>/<org>/upgiter/ — it derives <base> by
@@ -89,9 +75,8 @@ force_reset_to_remote() {
 DRY_RUN=0
 FETCH=0
 UPDATE=0
-SYNC=0
 ORG_ARG=""
-USAGE="Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update | -s|--sync] -o|--org <org-or-user>"
+USAGE="Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run|-d)
@@ -104,10 +89,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --update|-u)
       UPDATE=1
-      shift
-      ;;
-    --sync|-s)
-      SYNC=1
       shift
       ;;
     --org|-o)
@@ -127,8 +108,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 # Modes are mutually exclusive
-if [ "$((FETCH + UPDATE + SYNC))" -gt 1 ]; then
-  echo "Error: -f/--fetch, -u/--update, and -s/--sync are mutually exclusive." >&2
+if [ "$((FETCH + UPDATE))" -gt 1 ]; then
+  echo "Error: -f/--fetch and -u/--update are mutually exclusive." >&2
   echo "$USAGE" >&2
   exit 1
 fi
@@ -266,119 +247,10 @@ if [ "$FETCH" -eq 1 ]; then
   fi
 
 elif [ "$UPDATE" -eq 1 ]; then
-  # --- UPDATE MODE: hard-reset existing repos to remote default branch ---
-  echo "Updating existing repos for org/user: $ORG"
-
-  # Initialize counters and printable lists
-  updated_count=0
-  uptodate_count=0
-  skipped_count=0
-  warning_count=0
-  failed_count=0
-  updated_list=""
-  uptodate_list=""
-  skipped_list=""
-  warning_list=""
-  failed_list=""
-
-  # Iterate over every subdirectory in the target org folder
-  for target in "$TARGET_ROOT"/*/; do
-    [ -d "$target" ] || continue
-    repo="$(basename "$target")"
-
-    # Skip this repo itself to avoid resetting the running script
-    if [ "$(cd "$target" && pwd)" = "$REPO_ROOT" ]; then
-      continue
-    fi
-
-    # Skip directories that are not git repos
-    if [ ! -d "$target/.git" ]; then
-      skipped_count=$((skipped_count + 1))
-      skipped_list="$skipped_list $repo"
-      continue
-    fi
-
-    # Detect default branch from origin/HEAD (e.g. "main" or "master")
-    # If origin/HEAD is not set (e.g. repo was git-init'd, not cloned), auto-detect it
-    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
-    if [ -z "$default_branch" ]; then
-      git -C "$target" remote set-head origin --auto >/dev/null 2>&1 || true
-      default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
-    fi
-    if [ -z "$default_branch" ]; then
-      warning_count=$((warning_count + 1))
-      warning_list="$warning_list $repo"
-      echo "  WARN: $repo — cannot detect default branch, skipping"
-      continue
-    fi
-
-    if [ "$DRY_RUN" -eq 1 ]; then
-      echo "DRY RUN: would reset $repo to origin/$default_branch"
-      updated_count=$((updated_count + 1))
-      updated_list="$updated_list $repo"
-    else
-      # Fetch latest state from remote
-      git -C "$target" fetch origin || true
-
-      # Check if repo is already in sync: on default branch, at remote HEAD,
-      # clean working tree, and no stashes
-      current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-      local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
-      remote_head="$(git -C "$target" rev-parse "origin/$default_branch" 2>/dev/null || true)"
-      dirty="$(git -C "$target" status --porcelain 2>/dev/null || true)"
-      stash_count="$(git -C "$target" stash list 2>/dev/null | wc -l || true)"
-
-      if [ "$current_branch" = "$default_branch" ] && \
-         [ "$local_head" = "$remote_head" ] && \
-         [ -z "$dirty" ] && \
-         [ "$stash_count" -eq 0 ]; then
-        uptodate_count=$((uptodate_count + 1))
-        uptodate_list="$uptodate_list $repo"
-        continue
-      fi
-
-      echo "  Resetting $repo to origin/$default_branch ..."
-      if force_reset_to_remote "$target" "$default_branch"; then
-        updated_count=$((updated_count + 1))
-        updated_list="$updated_list $repo"
-      else
-        failed_count=$((failed_count + 1))
-        failed_list="$failed_list $repo"
-        echo "  FAILED: $repo — could not reset to origin/$default_branch"
-      fi
-    fi
-  done
-
-  # Print a simple summary
-  echo ""
-  echo "Summary:"
-  echo "  Updated:    $updated_count"
-  echo "  Up to date: $uptodate_count"
-  echo "  Skipped:    $skipped_count (not a git repo)"
-  echo "  Warned:     $warning_count (no default branch)"
-  echo "  Failed:     $failed_count (reset error)"
-
-  if [ "$updated_count" -gt 0 ]; then
-    echo "  Updated list: $updated_list"
-  fi
-  if [ "$uptodate_count" -gt 0 ]; then
-    echo "  Up to date list: $uptodate_list"
-  fi
-  if [ "$skipped_count" -gt 0 ]; then
-    echo "  Skipped list: $skipped_list"
-  fi
-  if [ "$warning_count" -gt 0 ]; then
-    echo "  Warning list: $warning_list"
-  fi
-  if [ "$failed_count" -gt 0 ]; then
-    echo "  Failed list: $failed_list"
-  fi
-
-elif [ "$SYNC" -eq 1 ]; then
-  # --- SYNC MODE: clone missing + hard-reset modified ("nuclear button") ---
+  # --- UPDATE MODE: clone missing + hard-reset modified ("nuclear button") ---
   # Archived repos are intentionally excluded (--no-archived): mothballed repos
   # should not be cloned or reset back onto your machine.
-  echo "Syncing org/user: $ORG (clone missing + hard-reset modified; archived repos skipped)"
+  echo "Updating org/user: $ORG (clone missing + hard-reset modified; archived repos skipped)"
 
   # Get all non-archived repo names from the org via GH CLI
   repos=$(gh repo list "$ORG" --no-archived --limit 1000 --json name -q '.[].name')
