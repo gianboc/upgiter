@@ -96,6 +96,12 @@ GitHub:
 - **Present and modified** → hard-reset to remote default branch (same
   destruction rules as `-u`).
 
+> **Archived repos are skipped.** Sync runs `gh repo list --no-archived`, so
+> repos you've archived on GitHub are never cloned or reset. This is the clean
+> way to "mothball" a repo: archive it on GitHub and `-s` will leave it alone.
+> (Note: this only affects `-s`. Default Clone mode still clones archived repos,
+> and `-u`/`-f` work off your local folder regardless of archive status.)
+
 Mode flags `-f`, `-u`, and `-s` are mutually exclusive — passing two at once
 exits with an error.
 

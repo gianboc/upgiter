@@ -376,10 +376,12 @@ elif [ "$UPDATE" -eq 1 ]; then
 
 elif [ "$SYNC" -eq 1 ]; then
   # --- SYNC MODE: clone missing + hard-reset modified ("nuclear button") ---
-  echo "Syncing org/user: $ORG (clone missing + hard-reset modified)"
+  # Archived repos are intentionally excluded (--no-archived): mothballed repos
+  # should not be cloned or reset back onto your machine.
+  echo "Syncing org/user: $ORG (clone missing + hard-reset modified; archived repos skipped)"
 
-  # Get all repo names from the org via GH CLI
-  repos=$(gh repo list "$ORG" --limit 1000 --json name -q '.[].name')
+  # Get all non-archived repo names from the org via GH CLI
+  repos=$(gh repo list "$ORG" --no-archived --limit 1000 --json name -q '.[].name')
 
   if [ -z "$repos" ]; then
     echo "No repositories found for org: $ORG"
