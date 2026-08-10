@@ -11,6 +11,9 @@ Three modes:
 Underneath it's just `gh` + `git` in a loop, but with a consistent folder
 layout and a one-screen summary at the end.
 
+Forgot which flag does what? Run **`upgiter -h`** for a one-screen cheatsheet of
+all modes and options.
+
 ## Setup
 
 Add this line to `~/.bashrc` (adjust the path if your clone lives elsewhere):

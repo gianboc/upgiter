@@ -84,6 +84,38 @@ detect_jobs() {
   echo "$j"
 }
 
+# Print a full cheatsheet (so you don't have to re-read the source after a month).
+show_help() {
+  cat <<'EOF'
+upgiter — bulk GitHub repo manager
+
+Usage: upgiter [-d] [-p] [-f | -u] -o <org-or-user>
+
+Modes (pick at most one; default is CLONE):
+  (none)  CLONE    Clone repos you're MISSING locally. Existing repos are left
+                   alone. Safe — never changes files you already have.
+  -f      FETCH    Report which local repos are stale (on another branch, behind
+                   remote, dirty, or stashed). Read-only — changes nothing.
+  -u      UPDATE   The "nuclear button": make your local folder EXACTLY match
+                   GitHub. Clones anything missing AND hard-resets anything
+                   modified back to the remote. DESTRUCTIVE — discards local
+                   commits, uncommitted changes, untracked files, and stashes.
+                   Clean repos and archived repos are left untouched.
+
+Options:
+  -d, --dry-run    Show what would happen; change nothing. Pair with -u to preview.
+  -p, --parallel   Fetch repos concurrently ((cores-2) jobs). Big speedup for -f.
+  -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
+  -h, --help       This cheatsheet.
+
+Examples:
+  upgiter -o gianboc          # clone anything I'm missing
+  upgiter -f -p -o gianboc    # fast, read-only "what's stale?" report
+  upgiter -d -u -o gianboc    # PREVIEW a full sync (safe)
+  upgiter -u -o gianboc       # make local match GitHub (destroys local changes)
+EOF
+}
+
 # Parse flags
 DRY_RUN=0
 FETCH=0
@@ -93,6 +125,10 @@ ORG_ARG=""
 USAGE="Usage: upgiter [-d|--dry-run] [-p|--parallel] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --help|-h)
+      show_help
+      exit 0
+      ;;
     --dry-run|-d)
       DRY_RUN=1
       shift

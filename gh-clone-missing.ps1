@@ -17,6 +17,39 @@
 # Script folder
 $scriptDir = $PSScriptRoot
 
+# Print a full cheatsheet (so you don't have to re-read the source after a month).
+function Show-Help {
+  Write-Host @'
+upgiter (PowerShell) - bulk GitHub repo manager
+
+Usage: .\gh-clone-missing.ps1 [-d] [-p] [-f | -u] -o <org-or-user>
+
+Modes (pick at most one; default is CLONE):
+  (none)  CLONE    Clone repos you're MISSING locally. Existing repos are left
+                   alone. Safe - never changes files you already have.
+  -f      FETCH    Report which local repos are stale (on another branch, behind
+                   remote, dirty, or stashed). Read-only - changes nothing.
+  -u      UPDATE   The "nuclear button": make your local folder EXACTLY match
+                   GitHub. Clones anything missing AND hard-resets anything
+                   modified back to the remote. DESTRUCTIVE - discards local
+                   commits, uncommitted changes, untracked files, and stashes.
+                   Clean repos and archived repos are left untouched.
+
+Options:
+  -d, --dry-run    Show what would happen; change nothing. Pair with -u to preview.
+  -p, --parallel   Fetch repos concurrently ((cores-2) jobs). Big speedup for -f.
+                   Requires PowerShell 7+; falls back to serial on 5.1.
+  -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
+  -h, --help       This cheatsheet.
+
+Examples:
+  .\gh-clone-missing.ps1 -o gianboc          # clone anything I'm missing
+  .\gh-clone-missing.ps1 -f -p -o gianboc    # fast, read-only "what's stale?" report
+  .\gh-clone-missing.ps1 -d -u -o gianboc    # PREVIEW a full sync (safe)
+  .\gh-clone-missing.ps1 -u -o gianboc       # make local match GitHub (destroys local changes)
+'@
+}
+
 # Walk up from a directory to find the nearest .git root
 function Get-RepoRoot {
   param([string]$startDir)
@@ -76,6 +109,10 @@ $orgArg = $null
 $usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--parallel|-p] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
+  if ($arg -eq "--help" -or $arg -eq "-h") {
+    Show-Help
+    exit 0
+  }
   if ($arg -eq "--dry-run" -or $arg -eq "-d") {
     $dryRun = $true
     continue
