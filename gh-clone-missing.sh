@@ -71,12 +71,26 @@ force_reset_to_remote() {
   return 0
 }
 
+# Decide how many parallel jobs to use: (CPU cores - 2), floored at 1. Leaving
+# two cores free keeps the machine responsive during a big sweep. Detecting the
+# count is a single, sub-millisecond kernel query — negligible next to even one
+# network fetch — so we just do it each run. `nproc` (GNU, honours cgroup/CPU
+# affinity limits) with a POSIX fallback and a hard floor of 1.
+detect_jobs() {
+  local cores j
+  cores="$( nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1 )"
+  j=$((cores - 2))
+  [ "$j" -lt 1 ] && j=1
+  echo "$j"
+}
+
 # Parse flags
 DRY_RUN=0
 FETCH=0
 UPDATE=0
+PARALLEL=0
 ORG_ARG=""
-USAGE="Usage: upgiter [-d|--dry-run] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
+USAGE="Usage: upgiter [-d|--dry-run] [-p|--parallel] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run|-d)
