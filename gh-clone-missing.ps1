@@ -40,6 +40,9 @@ Options:
                    fetches/clones in parallel ((cores-2) jobs) - much faster on a
                    big org. Needs PowerShell 7+ for parallel; auto-serial on 5.1.
   -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
+  --porcelain      Machine-readable, offline per-repo status (for the GUI /
+                   scripts): one TAB line "repo<TAB>STATE<TAB>branch<TAB>detail".
+                   STATE = CLEAN|DIRTY|AHEAD|BEHIND|DIVERGED|NOUPSTREAM.
   -h, --help       This cheatsheet.
 
 Examples:
@@ -105,8 +108,9 @@ $dryRun = $false
 $fetch = $false
 $update = $false
 $parallel = $true   # parallel by default; --serial turns it off
+$porcelain = $false
 $orgArg = $null
-$usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--serial] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
+$usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--serial] [--fetch|-f | --update|-u | --porcelain] --org|-o <org-or-user>"
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
   if ($arg -eq "--help" -or $arg -eq "-h") {
@@ -119,6 +123,10 @@ for ($i = 0; $i -lt $args.Count; $i++) {
   }
   if ($arg -eq "--serial") {
     $parallel = $false
+    continue
+  }
+  if ($arg -eq "--porcelain") {
+    $porcelain = $true
     continue
   }
   if ($arg -eq "--fetch" -or $arg -eq "-f") {
@@ -180,6 +188,52 @@ $org = if ($orgArg) { $orgArg } else { Split-Path -Leaf $repoRoot }
 $targetRoot = Join-Path $baseRoot $org
 if (-not (Test-Path $targetRoot)) {
   New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
+}
+
+# ---------- PORCELAIN: fast, offline, machine-readable status (for the GUI) ----------
+# Emits one TAB-separated line per local git repo, nothing else - no banners, no
+# network. Same contract as the bash script:
+#   <repo>`t<STATE>`t<branch>`t<detail>
+#   STATE in CLEAN DIRTY AHEAD BEHIND DIVERGED NOUPSTREAM  (offline; cached refs)
+if ($porcelain) {
+  Get-ChildItem -Path $targetRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $target = $_.FullName
+    if (-not (Test-Path (Join-Path $target ".git"))) { return }
+    $repo = $_.Name
+
+    $branch = git -C $target rev-parse --abbrev-ref HEAD 2>$null
+    if (-not $branch) { $branch = "?" }
+    $defaultBranch = git -C $target symbolic-ref refs/remotes/origin/HEAD 2>$null
+    if ($defaultBranch) { $defaultBranch = $defaultBranch -replace '^refs/remotes/origin/', '' }
+    $dirty = git -C $target status --porcelain 2>$null
+    $stashN = @(git -C $target stash list 2>$null).Count
+
+    $state = "CLEAN"
+    $detail = ""
+    if ($dirty) {
+      $lines = @($dirty)
+      # NB: match untracked ("?? path") literally — '?' is a wildcard in -like,
+      # so use StartsWith, not -like '??*' (which would match every line).
+      $untracked = @($lines | Where-Object { $_.StartsWith('??') }).Count
+      $changed = $lines.Count - $untracked
+      $state = "DIRTY"; $detail = "$changed changed, $untracked untracked"
+    } elseif ($defaultBranch) {
+      $counts = git -C $target rev-list --left-right --count "HEAD...origin/$defaultBranch" 2>$null
+      $ahead = 0; $behind = 0
+      if ($counts -match '^\s*(\d+)\s+(\d+)') { $ahead = [int]$Matches[1]; $behind = [int]$Matches[2] }
+      if ($ahead -gt 0 -and $behind -gt 0) { $state = "DIVERGED"; $detail = "$ahead ahead, $behind behind" }
+      elseif ($behind -gt 0) { $state = "BEHIND"; $detail = "$behind behind" }
+      elseif ($ahead -gt 0) { $state = "AHEAD"; $detail = "$ahead ahead" }
+    } else {
+      $state = "NOUPSTREAM"; $detail = "no upstream"
+    }
+    if ($stashN -gt 0) {
+      if ($detail) { $detail = "$detail, $stashN stash" } else { $detail = "$stashN stash" }
+    }
+
+    [Console]::Out.WriteLine("$repo`t$state`t$branch`t$detail")
+  }
+  exit 0
 }
 
 # Make sure the GH CLI is installed

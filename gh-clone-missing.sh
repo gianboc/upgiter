@@ -111,6 +111,9 @@ Options:
                    fetches/clones in parallel ((cores-2) jobs) — much faster on a
                    big org; --serial opts out.
   -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
+  --porcelain      Machine-readable, offline per-repo status (for the GUI /
+                   scripts): one TAB line "repo<TAB>STATE<TAB>branch<TAB>detail".
+                   STATE = CLEAN|DIRTY|AHEAD|BEHIND|DIVERGED|NOUPSTREAM.
   -h, --help       This cheatsheet.
 
 Examples:
@@ -126,8 +129,9 @@ DRY_RUN=0
 FETCH=0
 UPDATE=0
 PARALLEL=1   # parallel by default; --serial turns it off
+PORCELAIN=0
 ORG_ARG=""
-USAGE="Usage: upgiter [-d|--dry-run] [--serial] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
+USAGE="Usage: upgiter [-d|--dry-run] [--serial] [-f|--fetch | -u|--update | --porcelain] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help|-h)
@@ -140,6 +144,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --serial)
       PARALLEL=0
+      shift
+      ;;
+    --porcelain)
+      PORCELAIN=1
       shift
       ;;
     --fetch|-f)
@@ -199,6 +207,66 @@ fi
 # Target org folder is a sibling of this repo (e.g., .../GITHUB/<org>)
 TARGET_ROOT="$BASE_ROOT/$ORG"
 mkdir -p "$TARGET_ROOT"
+
+# ---------- PORCELAIN: fast, offline, machine-readable status (for the GUI) ----------
+# Emits one TAB-separated line per local git repo, nothing else — no banners, no
+# network. Designed to be called (often via `wsl.exe … bash … --porcelain`) and
+# parsed by a front-end. Contract (stable):
+#
+#   <repo>\t<STATE>\t<branch>\t<detail>
+#
+#   STATE ∈ CLEAN DIRTY AHEAD BEHIND DIVERGED NOUPSTREAM
+#     CLEAN       on its default branch, level with the last-known remote tip
+#     DIRTY       uncommitted changes and/or untracked files (and/or stashes)
+#     BEHIND      behind the cached remote tip (needs a fetch to be current)
+#     AHEAD       has local commits not on the cached remote tip
+#     DIVERGED    both ahead and behind
+#     NOUPSTREAM  no origin/HEAD to compare against
+#   branch  current branch; detail  short human summary (for a tooltip)
+#
+# Offline by design: ahead/behind are computed against the *cached* origin ref,
+# so BEHIND is only as fresh as the last fetch. A network refresh (fetch + the
+# remote repo list, which also surfaces not-yet-cloned repos) is a separate,
+# slower call the front-end triggers on demand. Non-git dirs emit no line.
+if [ "$PORCELAIN" -eq 1 ]; then
+  for target in "$TARGET_ROOT"/*/; do
+    [ -d "$target/.git" ] || continue
+    repo="$(basename "$target")"
+
+    branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    default_branch="$(git -C "$target" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    dirty="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+    stash_n="$(git -C "$target" stash list 2>/dev/null | wc -l | tr -d ' ')"
+
+    state="CLEAN"
+    detail=""
+    if [ -n "$dirty" ]; then
+      changed="$(printf '%s\n' "$dirty" | grep -vc '^??' || true)"
+      untracked="$(printf '%s\n' "$dirty" | grep -c '^??' || true)"
+      state="DIRTY"
+      detail="${changed} changed, ${untracked} untracked"
+    elif [ -n "$default_branch" ]; then
+      counts="$(git -C "$target" rev-list --left-right --count "HEAD...origin/$default_branch" 2>/dev/null || true)"
+      ahead="$(printf '%s' "$counts" | awk '{print $1+0}')"
+      behind="$(printf '%s' "$counts" | awk '{print $2+0}')"
+      if [ "${ahead:-0}" -gt 0 ] && [ "${behind:-0}" -gt 0 ]; then
+        state="DIVERGED"; detail="${ahead} ahead, ${behind} behind"
+      elif [ "${behind:-0}" -gt 0 ]; then
+        state="BEHIND"; detail="${behind} behind"
+      elif [ "${ahead:-0}" -gt 0 ]; then
+        state="AHEAD"; detail="${ahead} ahead"
+      fi
+    else
+      state="NOUPSTREAM"; detail="no upstream"
+    fi
+    if [ "$stash_n" -gt 0 ]; then
+      detail="${detail:+$detail, }${stash_n} stash"
+    fi
+
+    printf '%s\t%s\t%s\t%s\n' "$repo" "$state" "$branch" "$detail"
+  done
+  exit 0
+fi
 
 # Make sure the GH CLI is installed
 if ! command -v gh >/dev/null 2>&1; then
