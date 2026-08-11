@@ -16,6 +16,9 @@ set -euo pipefail
 #                       stashes). Clean repos are left untouched. Makes local
 #                       match remote in one shot. Use -d to preview.
 #   -d / --dry-run      Print what would happen without making changes.
+#   --serial            Fetch/clone one repo at a time. By DEFAULT upgiter runs
+#                       the network work in parallel ((CPU cores - 2) jobs), which
+#                       is much faster on a big org; --serial opts out.
 #
 # Folder layout (required): <base>/<org>/<repo>
 #   This script must live at <base>/<org>/upgiter/ — it derives <base> by
@@ -89,7 +92,7 @@ show_help() {
   cat <<'EOF'
 upgiter — bulk GitHub repo manager
 
-Usage: upgiter [-d] [-p] [-f | -u] -o <org-or-user>
+Usage: upgiter [-d] [--serial] [-f | -u] -o <org-or-user>
 
 Modes (pick at most one; default is CLONE):
   (none)  CLONE    Clone repos you're MISSING locally. Existing repos are left
@@ -104,13 +107,15 @@ Modes (pick at most one; default is CLONE):
 
 Options:
   -d, --dry-run    Show what would happen; change nothing. Pair with -u to preview.
-  -p, --parallel   Fetch repos concurrently ((cores-2) jobs). Big speedup for -f.
+  --serial         Do the network work one repo at a time. By DEFAULT upgiter
+                   fetches/clones in parallel ((cores-2) jobs) — much faster on a
+                   big org; --serial opts out.
   -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
   -h, --help       This cheatsheet.
 
 Examples:
   upgiter -o gianboc          # clone anything I'm missing
-  upgiter -f -p -o gianboc    # fast, read-only "what's stale?" report
+  upgiter -f -o gianboc       # fast, read-only "what's stale?" report
   upgiter -d -u -o gianboc    # PREVIEW a full sync (safe)
   upgiter -u -o gianboc       # make local match GitHub (destroys local changes)
 EOF
@@ -120,9 +125,9 @@ EOF
 DRY_RUN=0
 FETCH=0
 UPDATE=0
-PARALLEL=0
+PARALLEL=1   # parallel by default; --serial turns it off
 ORG_ARG=""
-USAGE="Usage: upgiter [-d|--dry-run] [-p|--parallel] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
+USAGE="Usage: upgiter [-d|--dry-run] [--serial] [-f|--fetch | -u|--update] -o|--org <org-or-user>"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help|-h)
@@ -131,6 +136,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --dry-run|-d)
       DRY_RUN=1
+      shift
+      ;;
+    --serial)
+      PARALLEL=0
       shift
       ;;
     --fetch|-f)
@@ -162,6 +171,14 @@ if [ "$((FETCH + UPDATE))" -gt 1 ]; then
   echo "Error: -f/--fetch and -u/--update are mutually exclusive." >&2
   echo "$USAGE" >&2
   exit 1
+fi
+
+# Resolve the parallel job count once. Parallel is the default; --serial sets
+# PARALLEL=0 and pins JOBS=1 so the network work runs one repo at a time.
+if [ "$PARALLEL" -eq 1 ]; then
+  JOBS="$(detect_jobs)"
+else
+  JOBS=1
 fi
 
 # Determine repo root and base folder that contains org folders
@@ -197,6 +214,19 @@ echo "Target folder: $TARGET_ROOT"
 if [ "$FETCH" -eq 1 ]; then
   # --- FETCH MODE: read-only check for stale repos ---
   echo "Checking repo status for org/user: $ORG"
+
+  # Parallel pre-fetch (default): the per-repo `git fetch` is network-bound and
+  # the calls are independent, so we fire them all through xargs -P first. The
+  # analysis loop below then reads already-updated origin/* refs and skips its
+  # own inline fetch. Null-delimited paths so folder names with spaces survive.
+  # With --serial (PARALLEL=0) this is skipped and each repo is fetched inline.
+  if [ "$PARALLEL" -eq 1 ]; then
+    echo "Parallel fetch: $JOBS jobs"
+    for target in "$TARGET_ROOT"/*/; do
+      [ -d "$target/.git" ] || continue
+      printf '%s\0' "$target"
+    done | xargs -0 -r -P "$JOBS" -I{} git -C {} fetch origin >/dev/null 2>&1 || true
+  fi
 
   # Initialize counters and printable lists
   stale_count=0
@@ -239,8 +269,10 @@ if [ "$FETCH" -eq 1 ]; then
       continue
     fi
 
-    # Fetch latest state from remote
-    git -C "$target" fetch origin 2>/dev/null || true
+    # Fetch latest state from remote (skipped if the parallel pre-fetch ran)
+    if [ "$PARALLEL" -eq 0 ]; then
+      git -C "$target" fetch origin 2>/dev/null || true
+    fi
 
     # Check each condition to build a reason string
     current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -322,6 +354,37 @@ elif [ "$UPDATE" -eq 1 ]; then
   warning_list=""
   failed_list=""
 
+  # Parallel pre-pass (default): the network work — cloning missing repos and
+  # fetching existing ones — is independent per repo, so we run it concurrently
+  # through xargs -P. The serial loop below then does the staleness check and the
+  # hard-reset (fast, local) plus all the bookkeeping. --serial (PARALLEL=0)
+  # skips this and the loop clones/fetches inline. We snapshot which repos were
+  # missing BEFORE cloning so the loop can still tell a freshly-cloned repo
+  # (count it as Cloned) from one we already had (maybe reset it).
+  cloned_before=" "
+  if [ "$PARALLEL" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "Parallel network: $JOBS jobs"
+    while IFS= read -r repo; do
+      [ -z "$repo" ] && continue
+      t="$TARGET_ROOT/$repo"
+      if [ ! -d "$t/.git" ] && [ ! -e "$t" ]; then
+        cloned_before="$cloned_before$repo "
+      fi
+    done <<EOF
+$repos
+EOF
+    export TARGET_ROOT ORG
+    printf '%s\n' "$repos" | grep -v '^[[:space:]]*$' | \
+      xargs -r -P "$JOBS" -I{} bash -c '
+        repo="$1"; t="$TARGET_ROOT/$repo"
+        if [ -d "$t/.git" ]; then
+          git -C "$t" fetch origin >/dev/null 2>&1
+        elif [ ! -e "$t" ]; then
+          gh repo clone "$ORG/$repo" "$t" >/dev/null 2>&1
+        fi
+      ' _ {} || true
+  fi
+
   while IFS= read -r repo; do
     if [ -z "$repo" ]; then
       continue
@@ -334,6 +397,20 @@ elif [ "$UPDATE" -eq 1 ]; then
       uptodate_count=$((uptodate_count + 1))
       uptodate_list="$uptodate_list $repo"
       continue
+    fi
+
+    # Freshly cloned in the parallel pre-pass? Count it as Cloned and move on
+    # (a brand-new clone is already at the remote tip; nothing to reset).
+    if [ "$PARALLEL" -eq 1 ]; then
+      case "$cloned_before" in
+        *" $repo "*)
+          if [ -d "$target/.git" ]; then
+            cloned_count=$((cloned_count + 1))
+            cloned_list="$cloned_list $repo"
+            continue
+          fi
+          ;;
+      esac
     fi
 
     # CASE A: not a git repo locally
@@ -373,7 +450,10 @@ elif [ "$UPDATE" -eq 1 ]; then
       continue
     fi
 
-    git -C "$target" fetch origin || true
+    # Fetch latest state (skipped if the parallel pre-pass already fetched it)
+    if [ "$PARALLEL" -eq 0 ]; then
+      git -C "$target" fetch origin || true
+    fi
 
     current_branch="$(git -C "$target" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     local_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
@@ -447,6 +527,32 @@ else
   skipped_list=""
   warning_list=""
 
+  # Parallel pre-pass (default): clone all missing repos concurrently, since the
+  # clones are independent. The serial loop below then just does the bookkeeping.
+  # --serial (PARALLEL=0) skips this and clones inline. Snapshot missing repos
+  # first so the loop can tell freshly-cloned (Cloned) from already-present (Skipped).
+  cloned_before=" "
+  if [ "$PARALLEL" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "Parallel clone: $JOBS jobs"
+    while IFS= read -r repo; do
+      [ -z "$repo" ] && continue
+      t="$TARGET_ROOT/$repo"
+      if [ ! -d "$t/.git" ] && [ ! -e "$t" ]; then
+        cloned_before="$cloned_before$repo "
+      fi
+    done <<EOF
+$repos
+EOF
+    export TARGET_ROOT ORG
+    printf '%s\n' "$repos" | grep -v '^[[:space:]]*$' | \
+      xargs -r -P "$JOBS" -I{} bash -c '
+        repo="$1"; t="$TARGET_ROOT/$repo"
+        if [ ! -e "$t" ]; then
+          gh repo clone "$ORG/$repo" "$t" >/dev/null 2>&1
+        fi
+      ' _ {} || true
+  fi
+
   # Loop over each repo and clone only if missing
   while IFS= read -r repo; do
     if [ -z "$repo" ]; then
@@ -454,6 +560,19 @@ else
     fi
 
     target="$TARGET_ROOT/$repo"
+
+    # Freshly cloned in the parallel pre-pass? Count it as Cloned and move on.
+    if [ "$PARALLEL" -eq 1 ]; then
+      case "$cloned_before" in
+        *" $repo "*)
+          if [ -d "$target/.git" ]; then
+            cloned_count=$((cloned_count + 1))
+            cloned_list="$cloned_list $repo"
+            continue
+          fi
+          ;;
+      esac
+    fi
 
     # Skip if repo already exists
     if [ -d "$target/.git" ]; then

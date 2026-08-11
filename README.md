@@ -69,14 +69,6 @@ Read-only. For each local repo: fetches from `origin`, then reports whether
 it's stale and why (off the default branch, behind remote, dirty working tree,
 or has stashes). No commits, no branch changes, no file edits.
 
-Add **`-p`/`--parallel`** to fetch all repos concurrently instead of one at a
-time. The per-repo fetch is network-bound (~0.8 s of round-trip each, mostly the
-TLS + auth handshake, not data), and the calls are independent — so on a
-many-repo org this is dramatically faster: on a ~40-repo org, **~42 s → ~3 s**
-(a 14× speedup). The flag takes no argument; it uses `(CPU cores − 2)` jobs,
-floored at 1, so it leaves the machine responsive. Core detection is a single
-sub-millisecond kernel query (`nproc`), negligible next to even one fetch.
-
 ### Update — the nuclear button (`-u`)
 
 ```bash
@@ -133,7 +125,27 @@ upgiter -d -u -o gianboc     # which would be cloned and which fetched/reset
 `-f` is already read-only, so `-d -f` adds nothing. In `-d -u`, missing repos
 are reported precisely as "would clone"; existing repos are reported as "would
 fetch + reset if stale" (update doesn't actually fetch in dry-run, so it can't
-distinguish stale from clean ahead of time).
+distinguish stale from clean ahead of time). The parallel pre-pass is skipped in
+dry-run (there's no network work to do).
+
+### Parallelism (on by default) and `--serial`
+
+Every mode's network work — cloning and fetching — is **parallel by default**.
+Those calls are independent per repo and network-bound (~0.8 s of round-trip
+each, mostly the TLS + auth handshake, not data), so running them concurrently
+is dramatically faster: on a ~40-repo org, a fetch scan drops from **~42 s to
+~3 s** (a 14× speedup). The job count is `(CPU cores − 2)`, floored at 1, so it
+leaves the machine responsive; core detection is a single sub-millisecond kernel
+query (`nproc`), negligible next to even one fetch.
+
+Pass **`--serial`** to force one-repo-at-a-time instead — useful for debugging,
+a flaky/constrained connection, or readable interleaved output. The hard-resets
+in `-u` always run serially regardless; only the network work is parallelized.
+
+```bash
+upgiter -f -o gianboc            # parallel (default)
+upgiter -f --serial -o gianboc   # one at a time
+```
 
 ## Examples
 

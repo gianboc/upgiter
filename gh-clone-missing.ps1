@@ -1,15 +1,14 @@
-# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--parallel|-p] [--fetch|-f | --update|-u] --org|-o <org-or-user>
+# Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--serial] [--fetch|-f | --update|-u] --org|-o <org-or-user>
 # Default mode: clones missing repos for a GitHub org/user into a sibling folder.
 # Fetch mode (-f): fetches and reports which repos are stale (read-only, no changes).
 # Update mode (-u): DESTRUCTIVE. The "nuclear button": clone missing repos AND
 #   hard-reset modified ones to the remote default branch (discards uncommitted
 #   work, untracked files, and stashes). Clean repos are left untouched. Makes
 #   local match remote in one shot. Use -d to preview.
-# Parallel (-p): fetch repos concurrently instead of one at a time, using
-#   (logical processors - 2) jobs, floored at 1. Applies to FETCH mode, where it
-#   is network-bound (~14x faster on a many-repo org). Requires PowerShell 7+
-#   for ForEach-Object -Parallel; on Windows PowerShell 5.1 it falls back to
-#   serial. No argument — the job count is derived from the machine.
+# Parallel by DEFAULT: cloning and fetching run concurrently, using
+#   (logical processors - 2) jobs, floored at 1 (~14x faster on a many-repo org).
+#   Requires PowerShell 7+ for ForEach-Object -Parallel; on Windows PowerShell
+#   5.1 it automatically runs serially. Pass --serial to force one-at-a-time.
 # Modes (-f / -u) are mutually exclusive; default is CLONE.
 # Folder layout: baseRoot/orgRoot/repoRoot  (e.g. GITHUB/gianboc/upgiter)
 # Repos are cloned into baseRoot/<target-org>/<repo>
@@ -22,7 +21,7 @@ function Show-Help {
   Write-Host @'
 upgiter (PowerShell) - bulk GitHub repo manager
 
-Usage: .\gh-clone-missing.ps1 [-d] [-p] [-f | -u] -o <org-or-user>
+Usage: .\gh-clone-missing.ps1 [-d] [--serial] [-f | -u] -o <org-or-user>
 
 Modes (pick at most one; default is CLONE):
   (none)  CLONE    Clone repos you're MISSING locally. Existing repos are left
@@ -37,16 +36,17 @@ Modes (pick at most one; default is CLONE):
 
 Options:
   -d, --dry-run    Show what would happen; change nothing. Pair with -u to preview.
-  -p, --parallel   Fetch repos concurrently ((cores-2) jobs). Big speedup for -f.
-                   Requires PowerShell 7+; falls back to serial on 5.1.
+  --serial         Do the network work one repo at a time. By DEFAULT upgiter
+                   fetches/clones in parallel ((cores-2) jobs) - much faster on a
+                   big org. Needs PowerShell 7+ for parallel; auto-serial on 5.1.
   -o, --org <name> GitHub org/user (required). Repos live in <base>/<name>/<repo>.
   -h, --help       This cheatsheet.
 
 Examples:
-  .\gh-clone-missing.ps1 -o gianboc          # clone anything I'm missing
-  .\gh-clone-missing.ps1 -f -p -o gianboc    # fast, read-only "what's stale?" report
-  .\gh-clone-missing.ps1 -d -u -o gianboc    # PREVIEW a full sync (safe)
-  .\gh-clone-missing.ps1 -u -o gianboc       # make local match GitHub (destroys local changes)
+  .\gh-clone-missing.ps1 -o gianboc            # clone anything I'm missing
+  .\gh-clone-missing.ps1 -f -o gianboc         # fast, read-only "what's stale?" report
+  .\gh-clone-missing.ps1 -d -u -o gianboc      # PREVIEW a full sync (safe)
+  .\gh-clone-missing.ps1 -u -o gianboc         # make local match GitHub (destroys local changes)
 '@
 }
 
@@ -104,9 +104,9 @@ function Reset-RepoToRemote {
 $dryRun = $false
 $fetch = $false
 $update = $false
-$parallel = $false
+$parallel = $true   # parallel by default; --serial turns it off
 $orgArg = $null
-$usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--parallel|-p] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
+$usage = "Usage: .\gh-clone-missing.ps1 [--dry-run|-d] [--serial] [--fetch|-f | --update|-u] --org|-o <org-or-user>"
 for ($i = 0; $i -lt $args.Count; $i++) {
   $arg = $args[$i]
   if ($arg -eq "--help" -or $arg -eq "-h") {
@@ -117,16 +117,16 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     $dryRun = $true
     continue
   }
+  if ($arg -eq "--serial") {
+    $parallel = $false
+    continue
+  }
   if ($arg -eq "--fetch" -or $arg -eq "-f") {
     $fetch = $true
     continue
   }
   if ($arg -eq "--update" -or $arg -eq "-u") {
     $update = $true
-    continue
-  }
-  if ($arg -eq "--parallel" -or $arg -eq "-p") {
-    $parallel = $true
     continue
   }
   if ($arg -eq "--org" -or $arg -eq "-o") {
@@ -150,13 +150,19 @@ if ($fetch -and $update) {
   exit 1
 }
 
-# Resolve the parallel job count once (only meaningful when -p is set):
-# (logical processors - 2), floored at 1, leaving two cores free so the machine
-# stays responsive. [Environment]::ProcessorCount is a free in-process property
-# read — no external command needed.
+# Resolve parallelism once. Parallel is the default; --serial turns it off.
+# ForEach-Object -Parallel needs PowerShell 7+, so on 5.1 we auto-downgrade to
+# serial (once, with a note) and every mode below can then just test $parallel.
+# Job count is (logical processors - 2), floored at 1, leaving two cores free.
+# [Environment]::ProcessorCount is a free in-process read — no external command.
 $jobs = 1
 if ($parallel) {
-  $jobs = [Math]::Max(1, [Environment]::ProcessorCount - 2)
+  if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $jobs = [Math]::Max(1, [Environment]::ProcessorCount - 2)
+  } else {
+    Write-Host "Note: parallel needs PowerShell 7+; running serially (use pwsh 7 for the speedup)."
+    $parallel = $false
+  }
 }
 
 # Determine repo root and base folder that contains org folders
@@ -191,23 +197,18 @@ if ($fetch) {
   # --- FETCH MODE: read-only check for stale repos ---
   Write-Host "Checking repo status for org/user: $org"
 
-  # Parallel pre-fetch: the per-repo `git fetch` is network-bound and the calls
-  # are independent, so with -p we fire them all through ForEach-Object -Parallel
-  # first. The analysis loop below then reads already-updated origin/* refs and
-  # skips its own inline fetch. -Parallel needs PowerShell 7+; on Windows
-  # PowerShell 5.1 we warn and fall back to the serial inline fetch.
+  # Parallel pre-fetch (default): the per-repo `git fetch` is network-bound and
+  # the calls are independent, so we fire them all through ForEach-Object
+  # -Parallel first. The analysis loop below then reads already-updated origin/*
+  # refs and skips its own inline fetch. (PS7 was verified above; on 5.1
+  # $parallel is already false, so this block is skipped and fetches run inline.)
   if ($parallel) {
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-      Write-Host "Parallel fetch: $jobs jobs"
-      $repoDirs = Get-ChildItem -Path $targetRoot -Directory |
-        Where-Object { (Test-Path (Join-Path $_.FullName ".git")) -and ($_.FullName -ne $repoRoot) } |
-        ForEach-Object { $_.FullName }
-      $repoDirs | ForEach-Object -ThrottleLimit $jobs -Parallel {
-        git -C $_ fetch origin *> $null
-      }
-    } else {
-      Write-Host "Parallel fetch requested, but PowerShell 7+ is required for -Parallel; falling back to serial."
-      $parallel = $false
+    Write-Host "Parallel fetch: $jobs jobs"
+    $repoDirs = Get-ChildItem -Path $targetRoot -Directory |
+      Where-Object { (Test-Path (Join-Path $_.FullName ".git")) -and ($_.FullName -ne $repoRoot) } |
+      ForEach-Object { $_.FullName }
+    $repoDirs | ForEach-Object -ThrottleLimit $jobs -Parallel {
+      git -C $_ fetch origin *> $null
     }
   }
 
@@ -253,7 +254,7 @@ if ($fetch) {
       return
     }
 
-    # Fetch latest state from remote (skipped if -p already pre-fetched above)
+    # Fetch latest state from remote (skipped if the parallel pre-fetch ran)
     if (-not $parallel) {
       git -C $target fetch origin 2>$null
     }
@@ -330,6 +331,31 @@ if ($fetch) {
   $warnings = @()
   $failed = @()
 
+  # Parallel pre-pass (default): clone missing + fetch existing concurrently, since
+  # the network work is independent per repo. The serial loop below does the
+  # staleness check + hard-reset (fast, local) plus the bookkeeping. Snapshot the
+  # missing repos BEFORE cloning so the loop can tell freshly-cloned (Cloned) from
+  # already-present (maybe reset). --serial / PS 5.1 -> $parallel false -> inline.
+  $clonedBefore = @{}
+  if ($parallel -and -not $dryRun) {
+    Write-Host "Parallel network: $jobs jobs"
+    $repoNames = $repos -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($r in $repoNames) {
+      $t = Join-Path $targetRoot $r
+      if (-not (Test-Path (Join-Path $t ".git")) -and -not (Test-Path $t)) {
+        $clonedBefore[$r] = $true
+      }
+    }
+    $repoNames | ForEach-Object -ThrottleLimit $jobs -Parallel {
+      $t = Join-Path $using:targetRoot $_
+      if (Test-Path (Join-Path $t ".git")) {
+        git -C $t fetch origin *> $null
+      } elseif (-not (Test-Path $t)) {
+        gh repo clone "$using:org/$_" $t *> $null
+      }
+    }
+  }
+
   $repos -split "`n" | ForEach-Object {
     $repo = $_.Trim()
     if (-not $repo) { return }
@@ -340,6 +366,12 @@ if ($fetch) {
     # Skip this repo itself to avoid resetting the running script
     if ((Test-Path $gitDir) -and ($target -eq $repoRoot)) {
       $uptodate += $repo
+      return
+    }
+
+    # Freshly cloned in the parallel pre-pass? Count it as Cloned and move on.
+    if ($parallel -and $clonedBefore.ContainsKey($repo) -and (Test-Path $gitDir)) {
+      $cloned += $repo
       return
     }
 
@@ -383,8 +415,10 @@ if ($fetch) {
       return
     }
 
-    # Fetch latest state from remote
-    git -C $target fetch origin
+    # Fetch latest state (skipped if the parallel pre-pass already fetched it)
+    if (-not $parallel) {
+      git -C $target fetch origin
+    }
 
     # Check if repo is already in sync: on default branch, at remote HEAD,
     # clean working tree, and no stashes
@@ -453,6 +487,28 @@ if ($fetch) {
   $skipped = @()
   $warnings = @()
 
+  # Parallel pre-pass (default): clone all missing repos concurrently, since the
+  # clones are independent. The serial loop below just does the bookkeeping.
+  # Snapshot missing repos first so the loop tells freshly-cloned (Cloned) from
+  # already-present (Skipped). --serial / PS 5.1 -> $parallel false -> inline.
+  $clonedBefore = @{}
+  if ($parallel -and -not $dryRun) {
+    Write-Host "Parallel clone: $jobs jobs"
+    $repoNames = $repos -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($r in $repoNames) {
+      $t = Join-Path $targetRoot $r
+      if (-not (Test-Path (Join-Path $t ".git")) -and -not (Test-Path $t)) {
+        $clonedBefore[$r] = $true
+      }
+    }
+    $repoNames | ForEach-Object -ThrottleLimit $jobs -Parallel {
+      $t = Join-Path $using:targetRoot $_
+      if (-not (Test-Path $t)) {
+        gh repo clone "$using:org/$_" $t *> $null
+      }
+    }
+  }
+
   # Loop over each repo and clone only if missing
   $repos -split "`n" | ForEach-Object {
     $repo = $_.Trim()
@@ -460,6 +516,12 @@ if ($fetch) {
 
     $target = Join-Path $targetRoot $repo
     $gitDir = Join-Path $target ".git"
+
+    # Freshly cloned in the parallel pre-pass? Count it as Cloned and move on.
+    if ($parallel -and $clonedBefore.ContainsKey($repo) -and (Test-Path $gitDir)) {
+      $cloned += $repo
+      return
+    }
 
     # Skip if repo already exists
     if (Test-Path $gitDir) {
