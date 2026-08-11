@@ -1,5 +1,12 @@
 # upgiter
 
+> **⚠️ This repository is archived — development has moved.**
+> `upgiter` is now a module inside the **GURF** monorepo,
+> [`gianboc/gurf`](https://github.com/gianboc/gurf), under `upgiter/`. GURF is a
+> Windows launcher + git repo manager that drives this engine through its
+> `--porcelain` interface. All further work happens there; this repo is frozen
+> and kept only for history.
+
 Bulk-manage every repo under a GitHub org or user account from one command.
 Three modes:
 
